@@ -58,6 +58,9 @@ provider = "file"
 [session]
 provider = "subprocess"
 
+[daemon]
+formula_v2 = false
+
 [providers.gemini]
 command = "echo"
 prompt_mode = "none"

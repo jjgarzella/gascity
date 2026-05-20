@@ -74,5 +74,23 @@ func GenerateCitySchema() (*jsonschema.Schema, error) {
 	s.Description = "Schema for city.toml — the PackV2 deployment file for a Gas City instance. " +
 		"Pack definitions live in pack.toml and conventional pack directories such as agents/, formulas/, orders/, and commands/. " +
 		"Use [imports.*] for PackV2 composition; legacy includes, [packs.*], and [[agent]] fields remain visible for migration compatibility."
+	removeRequiredField(s, "DaemonConfig", "formula_v2")
 	return s, nil
+}
+
+func removeRequiredField(s *jsonschema.Schema, definitionName, fieldName string) {
+	if s == nil || s.Definitions == nil {
+		return
+	}
+	def := s.Definitions[definitionName]
+	if def == nil || len(def.Required) == 0 {
+		return
+	}
+	required := def.Required[:0]
+	for _, name := range def.Required {
+		if name != fieldName {
+			required = append(required, name)
+		}
+	}
+	def.Required = required
 }

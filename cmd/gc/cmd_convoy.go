@@ -26,7 +26,7 @@ func newConvoyCmd(stdout, stderr io.Writer) *cobra.Command {
 A convoy is a named graph of beads with dependencies. Convoys
 group related issues via parent-child relationships.
 
-Convoys are distinct from workflows (graph.v2 formula-compiled
+Convoys are distinct from workflows (compiler-v2 formula-compiled
 DAGs managed by the dispatch subsystem) — gc convoy commands do
 not operate on workflow roots.`,
 		Args: cobra.ArbitraryArgs,

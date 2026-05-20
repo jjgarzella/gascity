@@ -356,6 +356,9 @@ source = "./assets/sidecar"
 name = "import-regression"
 provider = "claude"
 
+[daemon]
+formula_v2 = false
+
 [[rigs]]
 name = "repo"
 path = "./repo"

@@ -20,7 +20,6 @@ Formula instantiation happens via the CLI or the store interface:
 ```toml
 formula = "pancakes"
 description = "Make pancakes"
-version = 1
 
 [[steps]]
 id = "dry"
@@ -45,7 +44,7 @@ needs = ["dry", "wet"]
 |---|---|---|
 | `formula` | string | Unique formula name used by `gc formula cook`, `gc sling --formula`, and `Store.MolCook*` |
 | `description` | string | Human-readable description |
-| `version` | integer | Optional formula version marker |
+| `requires` | table | Optional host capability requirements such as `formula_compiler = ">=2.0.0"` |
 | `extends` | []string | Optional parent formulas to compose from |
 
 ## Step Fields
@@ -65,11 +64,11 @@ molecule.
 | `check` | object | Runtime retry: `max_attempts` with a `check` script after each attempt |
 | `timeout` | duration string | Default timeout for this step's `check` script; `check.check.timeout` takes precedence |
 
-## Graph.v2 Review Quorum Formula
+## Review Quorum Formula
 
 The core pack includes `mol-review-quorum`, a Gas City-owned review quorum
-formula scaffold. It is a `graph.v2` formula that fans out exactly two reviewer
-lanes and then routes synthesis for their durable outputs:
+formula scaffold. It declares `formula_compiler = ">=2.0.0"`, fans out exactly
+two reviewer lanes, and then routes synthesis for their durable outputs:
 
 - lane one, with ID, provider, model, and dispatch target supplied by formula
   variables

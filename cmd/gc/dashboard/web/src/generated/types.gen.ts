@@ -1069,7 +1069,6 @@ export type FormulaDetailResponse = {
     preview: FormulaPreviewResponse;
     steps: Array<FormulaStepResponse> | null;
     var_defs: Array<FormulaVarDefResponse> | null;
-    version: string;
 };
 
 export type FormulaFeedBody = {
@@ -1166,7 +1165,6 @@ export type FormulaSummaryResponse = {
     recent_runs: Array<FormulaRecentRunResponse> | null;
     run_count: number;
     var_defs: Array<FormulaVarDefResponse> | null;
-    version: string;
 };
 
 export type FormulaVarDefResponse = {
