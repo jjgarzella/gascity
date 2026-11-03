@@ -37,6 +37,21 @@ func workerFactoryWithStaleKeyDetectionWaiter(
 	cfg *config.City,
 	waiter session.StaleKeyDetectionWaiter,
 ) (*worker.Factory, error) {
+	return workerFactoryWithResolver(cityPath, store, sp, cfg, waiter, workerSessionRuntimeResolverWithConfig(cityPath, cfg))
+}
+
+func workerFactoryForResolvedRuntimeWithConfig(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City) (*worker.Factory, error) {
+	return workerFactoryWithResolver(cityPath, store, sp, cfg, nil, nil)
+}
+
+func workerFactoryWithResolver(
+	cityPath string,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	waiter session.StaleKeyDetectionWaiter,
+	resolveSessionRuntime worker.SessionRuntimeResolver,
+) (*worker.Factory, error) {
 	var (
 		resolveTransport func(template, provider string) string
 		searchPaths      []string
@@ -85,7 +100,7 @@ func workerFactoryWithStaleKeyDetectionWaiter(
 		Recorder:                cliFactoryEventsRecorder(cityPath, cfg),
 		UsageSink:               usageSinkForCity(cfg, cityPath),
 		ResolveTransport:        resolveTransport,
-		ResolveSessionRuntime:   workerSessionRuntimeResolverWithConfig(cityPath, cfg),
+		ResolveSessionRuntime:   resolveSessionRuntime,
 		StaleKeyDetectionWaiter: waiter,
 		Pricing:                 cfg.PricingRegistry(),
 	})
@@ -267,13 +282,60 @@ func newWorkerSessionHandleForResolvedRuntimeWithConfig(
 	resolved *config.ResolvedProvider,
 	metadata map[string]string,
 ) (worker.Handle, error) {
-	factory, err := workerFactoryWithConfig(cityPath, store, sp, cfg)
+	factory, sessionCfg, err := resolvedWorkerSessionHandleConfigWithConfig(
+		cityPath, store, sp, cfg, alias, explicitName, template, title, command, provider, workDir, transport, resolved, metadata,
+	)
 	if err != nil {
 		return nil, err
 	}
-	mcpServers, err := resolvedRuntimeMCPServersWithConfig(cityPath, cfg, alias, template, provider, workDir, transport, metadata)
+	return factory.SessionForResolvedRuntime(sessionCfg)
+}
+
+// newWorkerSessionHandleForDirectCreateWithConfig adds startup prompt delivery
+// to a fresh direct `gc session new` start. Deferred bead creation leaves prompt
+// resolution to the controller that will start the session.
+func newWorkerSessionHandleForDirectCreateWithConfig(
+	cityPath string,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	alias, explicitName, template, title, command, provider, workDir, transport string,
+	resolved *config.ResolvedProvider,
+	metadata map[string]string,
+) (worker.Handle, error) {
+	factory, sessionCfg, err := resolvedWorkerSessionHandleConfigWithConfig(
+		cityPath, store, sp, cfg, alias, explicitName, template, title, command, provider, workDir, transport, resolved, metadata,
+	)
 	if err != nil {
 		return nil, err
+	}
+	promptHints, err := workerDirectCreatePromptHints(cityPath, cfg, template, firstNonEmptyGCString(metadata["agent_name"], template), transport)
+	if err != nil {
+		return nil, fmt.Errorf("resolving direct-start prompt: %w", err)
+	}
+	applyWorkerStartupPromptHints(&sessionCfg.Runtime.Hints, promptHints)
+	return factory.SessionForResolvedRuntime(sessionCfg)
+}
+
+func resolvedWorkerSessionHandleConfigWithConfig(
+	cityPath string,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	alias, explicitName, template, title, command, provider, workDir, transport string,
+	resolved *config.ResolvedProvider,
+	metadata map[string]string,
+) (*worker.Factory, worker.ResolvedSessionConfig, error) {
+	// This caller supplies the complete runtime config directly. Leaving the
+	// persisted-record resolver off this factory keeps managed create/wake paths
+	// from invoking resume-only provider and prompt discovery.
+	factory, err := workerFactoryForResolvedRuntimeWithConfig(cityPath, store, sp, cfg)
+	if err != nil {
+		return nil, worker.ResolvedSessionConfig{}, err
+	}
+	mcpServers, err := resolvedRuntimeMCPServersWithConfig(cityPath, cfg, alias, template, provider, workDir, transport, metadata)
+	if err != nil {
+		return nil, worker.ResolvedSessionConfig{}, err
 	}
 	sessionCfg, err := resolvedWorkerSessionConfigWithConfig(
 		cityPath,
@@ -290,7 +352,7 @@ func newWorkerSessionHandleForResolvedRuntimeWithConfig(
 		mcpServers,
 	)
 	if err != nil {
-		return nil, err
+		return nil, worker.ResolvedSessionConfig{}, err
 	}
 	// Direct CLI creates use this resolver rather than resolveTemplate, so
 	// project the workspace environment here before handing the runtime to the
@@ -304,16 +366,7 @@ func newWorkerSessionHandleForResolvedRuntimeWithConfig(
 	// runtime.Config directly and never routes through resolveTemplate
 	// (gc-6bw8o).
 	applyWorkerOverlayHints(&sessionCfg.Runtime.Hints, cfg, cityPath, template, resolved)
-	// This is a fresh provider conversation even when the provider accepts a
-	// caller-generated session key. Render and route its initial prompt through
-	// the same policy as controller starts; later keyed resumes use the separate
-	// resume resolver and do not replay this startup text.
-	promptHints, err := workerDirectCreatePromptHints(cityPath, cfg, template, firstNonEmptyGCString(metadata["agent_name"], template), transport)
-	if err != nil {
-		return nil, fmt.Errorf("resolving direct-start prompt: %w", err)
-	}
-	applyWorkerStartupPromptHints(&sessionCfg.Runtime.Hints, promptHints)
-	return factory.SessionForResolvedRuntime(sessionCfg)
+	return factory, sessionCfg, nil
 }
 
 // workerDirectCreatePromptHints renders the configured initial prompt for a

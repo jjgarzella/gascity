@@ -1011,7 +1011,7 @@ func TestWorkerSessionCreateDeliversStartupPromptForFreshSessions(t *testing.T) 
 			}
 
 			sp := runtime.NewFake()
-			handle, err := newWorkerSessionHandleForResolvedRuntimeWithConfig(
+			handle, err := newWorkerSessionHandleForDirectCreateWithConfig(
 				fixtureInfo.WorkDir,
 				beads.NewMemStore(),
 				sp,
@@ -1213,7 +1213,7 @@ IFS= read -r ignored || true
 	if err != nil {
 		t.Fatalf("resolve direct-create fake provider: %v", err)
 	}
-	directHandle, err := newWorkerSessionHandleForResolvedRuntimeWithConfig(
+	directHandle, err := newWorkerSessionHandleForDirectCreateWithConfig(
 		info.WorkDir,
 		beads.NewMemStore(),
 		provider,

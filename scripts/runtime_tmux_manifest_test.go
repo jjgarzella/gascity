@@ -24,7 +24,7 @@ func TestRuntimeTmuxManifestMatchesCanonicalLinuxIntegrationInventory(t *testing
 	if drift := runtimeTmuxManifestDrift(manifest, declared); len(drift) != 0 {
 		t.Fatalf("runtime-tmux manifest drift:\n%s\nupdate %s", strings.Join(drift, "\n"), runtimeTmuxManifestRelativePath)
 	}
-	if got, want := len(manifest), 531; got != want {
+	if got, want := len(manifest), 532; got != want {
 		t.Fatalf("runtime-tmux manifest contains %d tests, want %d", got, want)
 	}
 
@@ -32,7 +32,7 @@ func TestRuntimeTmuxManifestMatchesCanonicalLinuxIntegrationInventory(t *testing
 	if got, want := len(untagged), 391; got != want {
 		t.Fatalf("runtime-tmux untagged inventory contains %d tests, want %d", got, want)
 	}
-	if got, want := len(declared)-len(untagged), 140; got != want {
+	if got, want := len(declared)-len(untagged), 141; got != want {
 		t.Fatalf("runtime-tmux integration-only inventory contains %d tests, want %d", got, want)
 	}
 }

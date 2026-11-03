@@ -432,7 +432,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	handle, err := newWorkerSessionHandleForResolvedRuntimeWithConfig(
+	handle, err := newWorkerSessionHandleForDirectCreateWithConfig(
 		cityPath,
 		sessStore,
 		sp,

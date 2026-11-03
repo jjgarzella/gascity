@@ -559,10 +559,10 @@ func TestSessionLifecycleChaosAgentDrainAckStopFailurePreservesRetry(t *testing.
 	}
 	h.env.sp.StopErrors[h.sessionName] = errors.New("chaos stop failure")
 
-	stopsBefore := h.countRuntimeCalls("Stop")
+	stopsBefore := h.countRuntimeCalls("StopIfCurrent")
 	h.record("agent drain ack with transient stop failure")
 	h.reconcileTickWithDrainOps()
-	h.waitForRuntimeCallCount("Stop", stopsBefore+1)
+	h.waitForRuntimeCallCount("StopIfCurrent", stopsBefore+1)
 
 	if !h.env.sp.IsRunning(h.sessionName) {
 		h.failf("stop failure removed runtime %q", h.sessionName)
@@ -576,10 +576,10 @@ func TestSessionLifecycleChaosAgentDrainAckStopFailurePreservesRetry(t *testing.
 	h.assertDrainAckStopPending()
 
 	delete(h.env.sp.StopErrors, h.sessionName)
-	stopsBefore = h.countRuntimeCalls("Stop")
+	stopsBefore = h.countRuntimeCalls("StopIfCurrent")
 	h.record("agent drain ack retry after stop recovers")
 	h.reconcileTickWithDrainOps()
-	h.waitForRuntimeCallCount("Stop", stopsBefore+1)
+	h.waitForRuntimeCallCount("StopIfCurrent", stopsBefore+1)
 	h.finalizeAsyncDrainAckStop()
 
 	if h.env.sp.IsRunning(h.sessionName) {
@@ -1173,13 +1173,15 @@ func (h *sessionChaosHarness) assertStarted() {
 	}
 	h.assertLastStartConfigMatches(b)
 	// runtime.Fake stores provider metadata separately from the Config.Env
-	// inherited by the fake process. Mirror the launched epoch into its GetMeta
-	// surface so generation-fenced drain tests observe the same identity that a
-	// live tmux provider reads from the session environment.
+	// inherited by the fake process. Mirror the complete launched identity into
+	// its GetMeta surface so conditional-stop tests observe the same identity
+	// that a live tmux provider reads from the session environment.
 	if start := h.env.sp.LastStartConfig(h.sessionName); start != nil {
-		if epoch := strings.TrimSpace(start.Env["GC_RUNTIME_EPOCH"]); epoch != "" {
-			if err := h.env.sp.SetMeta(h.sessionName, "GC_RUNTIME_EPOCH", epoch); err != nil {
-				h.failf("set fake runtime epoch metadata: %v", err)
+		for _, key := range []string{"GC_SESSION_ID", "GC_RUNTIME_EPOCH", "GC_INSTANCE_TOKEN"} {
+			if value := start.Env[key]; value != "" {
+				if err := h.env.sp.SetMeta(h.sessionName, key, value); err != nil {
+					h.failf("set fake runtime %s metadata: %v", key, err)
+				}
 			}
 		}
 	}
