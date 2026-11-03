@@ -39,7 +39,7 @@ func TestRuntimeTmuxManifestMatchesCanonicalLinuxIntegrationInventory(t *testing
 
 func TestRuntimeTmuxManifestSixShardsPartitionInventoryExactlyOnce(t *testing.T) {
 	manifest := parseRuntimeTmuxManifest(t, filepath.Join(repoRoot(t), runtimeTmuxManifestRelativePath))
-	wantShardCounts := []int{89, 89, 89, 88, 88, 88}
+	wantShardCounts := []int{89, 89, 89, 89, 88, 88}
 	seen := make(map[string]int, len(manifest))
 
 	for shardIndex := 0; shardIndex < len(wantShardCounts); shardIndex++ {
