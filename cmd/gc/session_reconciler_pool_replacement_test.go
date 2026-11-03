@@ -75,6 +75,15 @@ func TestReconcileSessionBeads_DrainAckNoWorkFreesSlotAndReallocates(t *testing.
 		if err := sp.Start(context.Background(), winner.Metadata["session_name"], runtime.Config{}); err != nil {
 			t.Fatalf("start winner runtime: %v", err)
 		}
+		for key, value := range map[string]string{
+			"GC_SESSION_ID":     winner.ID,
+			"GC_RUNTIME_EPOCH":  winner.Metadata["generation"],
+			"GC_INSTANCE_TOKEN": winner.Metadata["instance_token"],
+		} {
+			if err := sp.SetMeta(winner.Metadata["session_name"], key, value); err != nil {
+				t.Fatalf("set winner runtime identity %s: %v", key, err)
+			}
+		}
 		statusInProgress := "in_progress"
 		winnerAssignee := winner.ID
 		if err := store.Update(beadOne.ID, beads.UpdateOpts{Status: &statusInProgress, Assignee: &winnerAssignee}); err != nil {
@@ -92,6 +101,15 @@ func TestReconcileSessionBeads_DrainAckNoWorkFreesSlotAndReallocates(t *testing.
 		loserName := loser.Metadata["session_name"]
 		if err := sp.Start(context.Background(), loserName, runtime.Config{}); err != nil {
 			t.Fatalf("start loser runtime: %v", err)
+		}
+		for key, value := range map[string]string{
+			"GC_SESSION_ID":     loser.ID,
+			"GC_RUNTIME_EPOCH":  loser.Metadata["generation"],
+			"GC_INSTANCE_TOKEN": loser.Metadata["instance_token"],
+		} {
+			if err := sp.SetMeta(loserName, key, value); err != nil {
+				t.Fatalf("set loser runtime identity %s: %v", key, err)
+			}
 		}
 		dops := newFakeDrainOps()
 		if err := dops.setDrainAck(loserName); err != nil {

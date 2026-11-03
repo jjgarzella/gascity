@@ -167,6 +167,19 @@ func (h *SessionHandle) Kill(ctx context.Context) (err error) {
 	return err
 }
 
+// KillIfCurrent stops the provider runtime only while the supplied identity
+// still belongs to the current session incarnation.
+func (h *SessionHandle) KillIfCurrent(ctx context.Context, identity runtime.Identity) (stopped bool, err error) {
+	event := h.beginOperationEvent(ctx, workerOperationKill)
+	defer func() { event.finish(err) }()
+
+	id := h.currentSessionID()
+	if id == "" {
+		return false, nil
+	}
+	return h.manager.KillRuntimeIfCurrent(id, identity)
+}
+
 // Close permanently ends the worker session.
 func (h *SessionHandle) Close(ctx context.Context) (err error) {
 	_, err = h.CloseDetailed(ctx)

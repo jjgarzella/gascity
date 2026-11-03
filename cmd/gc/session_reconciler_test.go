@@ -127,6 +127,15 @@ func (p *blockingStopProvider) Stop(name string) error {
 	return p.Fake.Stop(name)
 }
 
+func (p *blockingStopProvider) StopIfCurrent(name string, identity runtime.Identity) (bool, error) {
+	select {
+	case p.stopStarted <- name:
+	default:
+	}
+	<-p.releaseStop
+	return p.Fake.StopIfCurrent(name, identity)
+}
+
 type panicStopProvider struct {
 	*runtime.Fake
 	stopStarted chan string
@@ -142,6 +151,45 @@ func newPanicStopProvider() *panicStopProvider {
 func (p *panicStopProvider) Stop(name string) error {
 	p.stopStarted <- name
 	panic("stop exploded")
+}
+
+func (p *panicStopProvider) StopIfCurrent(name string, _ runtime.Identity) (bool, error) {
+	p.stopStarted <- name
+	panic("stop exploded")
+}
+
+func createDrainAckAsyncStopTestSession(t *testing.T, store beads.Store, sp runtime.Provider, token string) (string, string) {
+	t.Helper()
+	const generation = "1"
+	const name = "worker"
+	metadata := map[string]string{
+		"session_name":   name,
+		"generation":     generation,
+		"instance_token": token,
+	}
+	for key, value := range sessionpkg.DrainAckStopPendingPatch(time.Now().UTC()) {
+		metadata[key] = value
+	}
+	bead, err := store.Create(beads.Bead{Title: name, Type: sessionBeadType, Metadata: metadata})
+	if err != nil {
+		t.Fatalf("create drain-ack test session: %v", err)
+	}
+	setter, ok := sp.(interface {
+		SetMeta(string, string, string) error
+	})
+	if !ok {
+		t.Fatalf("provider %T cannot seed runtime identity", sp)
+	}
+	for key, value := range map[string]string{
+		"GC_SESSION_ID":     bead.ID,
+		"GC_RUNTIME_EPOCH":  generation,
+		"GC_INSTANCE_TOKEN": token,
+	} {
+		if err := setter.SetMeta(name, key, value); err != nil {
+			t.Fatalf("set %s: %v", key, err)
+		}
+	}
+	return bead.ID, generation
 }
 
 type shutdownWaitStopProvider struct {
@@ -409,6 +457,18 @@ func (e *reconcilerTestEnv) markSessionActive(session *beads.Bead) {
 		"state":        "active",
 		"last_woke_at": e.clk.Now().UTC().Format(time.RFC3339),
 	})
+	// runtime.Fake does not seed GetMeta from Config.Env like live providers do.
+	// Active fixture sessions must expose the complete provider identity so
+	// conditional drain stops exercise the same contract as live providers.
+	for key, value := range map[string]string{
+		"GC_SESSION_ID":     session.ID,
+		"GC_RUNTIME_EPOCH":  session.Metadata["generation"],
+		"GC_INSTANCE_TOKEN": session.Metadata["instance_token"],
+	} {
+		if err := e.sp.SetMeta(session.Metadata["session_name"], key, value); err != nil {
+			panic("setting fake runtime identity: " + err.Error())
+		}
+	}
 }
 
 // TestReconcilerTestEnvSessionInfoHelpers exercises the createSessionInfo /
@@ -919,6 +979,9 @@ func TestReconcileSessionBeads_DrainAckMarksStopPendingAndStopsAsync(t *testing.
 	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start(worker): %v", err)
 	}
+	if err := sp.SetMeta("worker", "GC_RUNTIME_EPOCH", "1"); err != nil {
+		t.Fatalf("SetMeta(GC_RUNTIME_EPOCH): %v", err)
+	}
 	releaseStop := func() {
 		select {
 		case <-sp.releaseStop:
@@ -1210,9 +1273,10 @@ func TestQueueDrainAckAsyncStopTracksShutdownWait(t *testing.T) {
 	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start(worker): %v", err)
 	}
+	sessionID, generation := createDrainAckAsyncStopTestSession(t, store, sp, "test-token")
 	var stderr synchronizedBuffer
 	tracker := &asyncStartTracker{}
-	queueDrainAckAsyncStop("", store, sp, &config.City{}, "gc-worker", "worker", "", nil, tracker, &stderr)
+	queueDrainAckAsyncStopForGeneration("", store, sp, &config.City{}, sessionID, "worker", "test-token", generation, nil, tracker, &stderr)
 
 	select {
 	case <-sp.stopStarted:
@@ -1239,6 +1303,8 @@ func TestQueueDrainAckAsyncStopDedupScopedToTracker(t *testing.T) {
 	if err := second.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start(second worker): %v", err)
 	}
+	sessionID, generation := createDrainAckAsyncStopTestSession(t, store, first, "test-token")
+	secondSessionID, secondGeneration := createDrainAckAsyncStopTestSession(t, store, second, "second-token")
 	firstReleased := false
 	secondReleased := false
 	defer func() {
@@ -1253,14 +1319,14 @@ func TestQueueDrainAckAsyncStopDedupScopedToTracker(t *testing.T) {
 	var stderr synchronizedBuffer
 	firstTracker := &asyncStartTracker{}
 	secondTracker := &asyncStartTracker{}
-	queueDrainAckAsyncStop("", store, first, &config.City{}, "gc-worker", "worker", "", nil, firstTracker, &stderr)
+	queueDrainAckAsyncStopForGeneration("", store, first, &config.City{}, sessionID, "worker", "test-token", generation, nil, firstTracker, &stderr)
 	select {
 	case <-first.stopStarted:
 	case <-time.After(time.Second):
 		t.Fatal("first async drain-ack stop did not start")
 	}
 
-	queueDrainAckAsyncStop("", store, second, &config.City{}, "gc-worker", "worker", "", nil, secondTracker, &stderr)
+	queueDrainAckAsyncStopForGeneration("", store, second, &config.City{}, secondSessionID, "worker", "second-token", secondGeneration, nil, secondTracker, &stderr)
 	select {
 	case <-second.stopStarted:
 	case <-time.After(time.Second):
@@ -1284,9 +1350,10 @@ func TestQueueDrainAckAsyncStopRecoversStopPanic(t *testing.T) {
 	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start(worker): %v", err)
 	}
+	sessionID, generation := createDrainAckAsyncStopTestSession(t, store, sp, "test-token")
 	var stderr synchronizedBuffer
 	tracker := &asyncStartTracker{}
-	queueDrainAckAsyncStop(t.TempDir(), store, sp, &config.City{}, "gc-worker", "worker", "", nil, tracker, &stderr)
+	queueDrainAckAsyncStopForGeneration(t.TempDir(), store, sp, &config.City{}, sessionID, "worker", "test-token", generation, nil, tracker, &stderr)
 
 	select {
 	case <-sp.stopStarted:
@@ -1327,9 +1394,10 @@ func TestQueueDrainAckAsyncStopPokesAfterSuccessfulStop(t *testing.T) {
 	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	sessionID, generation := createDrainAckAsyncStopTestSession(t, store, sp, "test-token")
 	var stderr synchronizedBuffer
 	tracker := &asyncStartTracker{}
-	queueDrainAckAsyncStop("", store, sp, &config.City{}, "gc-worker", "worker", "", nil, tracker, &stderr)
+	queueDrainAckAsyncStopForGeneration("", store, sp, &config.City{}, sessionID, "worker", "test-token", generation, nil, tracker, &stderr)
 	if !tracker.wait(time.Second) {
 		t.Fatal("async drain-ack stop did not complete")
 	}
@@ -1363,10 +1431,11 @@ func TestQueueDrainAckAsyncStopDoesNotPokeOnHardError(t *testing.T) {
 	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	sessionID, generation := createDrainAckAsyncStopTestSession(t, store, sp, "stale-token")
 	sp.StopErrors = map[string]error{"worker": errors.New("hard kill error")}
 	var stderr synchronizedBuffer
 	tracker := &asyncStartTracker{}
-	queueDrainAckAsyncStop("", store, sp, &config.City{}, "gc-worker", "worker", "", nil, tracker, &stderr)
+	queueDrainAckAsyncStopForGeneration("", store, sp, &config.City{}, sessionID, "worker", "stale-token", generation, nil, tracker, &stderr)
 	if !tracker.wait(time.Second) {
 		t.Fatal("async drain-ack stop did not complete")
 	}
@@ -1402,6 +1471,7 @@ func TestQueueDrainAckAsyncStopTokenFenceSkipsReusedName(t *testing.T) {
 	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	sessionID, generation := createDrainAckAsyncStopTestSession(t, store, sp, "stale-token")
 	// The live session belongs to a replacement with a fresh token.
 	if err := sp.SetMeta("worker", "GC_INSTANCE_TOKEN", "live-token"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
@@ -1410,7 +1480,7 @@ func TestQueueDrainAckAsyncStopTokenFenceSkipsReusedName(t *testing.T) {
 	var stderr synchronizedBuffer
 	tracker := &asyncStartTracker{}
 	// We queued the stop for the OLD session (stale token).
-	queueDrainAckAsyncStop("", store, sp, &config.City{}, "gc-worker", "worker", "stale-token", nil, tracker, &stderr)
+	queueDrainAckAsyncStopForGeneration("", store, sp, &config.City{}, sessionID, "worker", "stale-token", generation, nil, tracker, &stderr)
 	if !tracker.wait(time.Second) {
 		t.Fatal("async drain-ack stop did not complete")
 	}
@@ -1418,8 +1488,8 @@ func TestQueueDrainAckAsyncStopTokenFenceSkipsReusedName(t *testing.T) {
 	if !sp.IsRunning("worker") {
 		t.Fatal("token-fenced async stop killed the name-reused replacement")
 	}
-	if got := stderr.String(); !strings.Contains(got, "instance token mismatch") {
-		t.Fatalf("stderr = %q, want token mismatch diagnostic", got)
+	if got := stderr.String(); !strings.Contains(got, "session or runtime identity changed") {
+		t.Fatalf("stderr = %q, want identity mismatch diagnostic", got)
 	}
 	pokeMu.Lock()
 	got := pokeCalls
@@ -1437,13 +1507,14 @@ func TestQueueDrainAckAsyncStopTokenFenceKillsMatchingSession(t *testing.T) {
 	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	sessionID, generation := createDrainAckAsyncStopTestSession(t, store, sp, "live-token")
 	if err := sp.SetMeta("worker", "GC_INSTANCE_TOKEN", "live-token"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
 	}
 
 	var stderr synchronizedBuffer
 	tracker := &asyncStartTracker{}
-	queueDrainAckAsyncStop("", store, sp, &config.City{}, "gc-worker", "worker", "live-token", nil, tracker, &stderr)
+	queueDrainAckAsyncStopForGeneration("", store, sp, &config.City{}, sessionID, "worker", "live-token", generation, nil, tracker, &stderr)
 	if !tracker.wait(time.Second) {
 		t.Fatal("async drain-ack stop did not complete")
 	}
@@ -1477,6 +1548,7 @@ func TestQueueDrainAckAsyncStopConfirmsRuntimeDead(t *testing.T) {
 	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	sessionID, generation := createDrainAckAsyncStopTestSession(t, store, sp, "test-token")
 	// Survivor: Stop reports success but the fake leaves the session (and thus
 	// IsRunning/ProcessAlive) observably alive, mirroring a claude process that
 	// ignores SIGHUP / reparents / races the kill grace period.
@@ -1484,19 +1556,19 @@ func TestQueueDrainAckAsyncStopConfirmsRuntimeDead(t *testing.T) {
 
 	var stderr synchronizedBuffer
 	tracker := &asyncStartTracker{}
-	queueDrainAckAsyncStop("", store, sp, &config.City{}, "gc-worker", "worker", "", []string{"claude"}, tracker, &stderr)
+	queueDrainAckAsyncStopForGeneration("", store, sp, &config.City{}, sessionID, "worker", "test-token", generation, []string{"claude"}, tracker, &stderr)
 	if !tracker.wait(time.Second) {
 		t.Fatal("async drain-ack stop did not complete")
 	}
 
 	stopCalls := 0
 	for _, call := range sp.Calls {
-		if call.Method == "Stop" && call.Name == "worker" {
+		if call.Method == "StopIfCurrent" && call.Name == "worker" {
 			stopCalls++
 		}
 	}
 	if stopCalls < 2 {
-		t.Fatalf("Stop call count = %d, want >= 2 (confirm-dead must re-issue the kill on a survivor)", stopCalls)
+		t.Fatalf("conditional stop call count = %d, want >= 2 (confirm-dead must re-issue the kill on a survivor)", stopCalls)
 	}
 }
 
@@ -1506,6 +1578,7 @@ func TestCityRuntimeShutdownWaitsForTrackedAsyncDrainAckStopsBeforeStopSnapshot(
 	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start(worker): %v", err)
 	}
+	sessionID, generation := createDrainAckAsyncStopTestSession(t, store, sp, "test-token")
 	cr := &CityRuntime{
 		cfg:                 &config.City{Daemon: config.DaemonConfig{ShutdownTimeout: "500ms"}},
 		sp:                  sp,
@@ -1515,7 +1588,7 @@ func TestCityRuntimeShutdownWaitsForTrackedAsyncDrainAckStopsBeforeStopSnapshot(
 		stdout:              ioDiscard{},
 		stderr:              ioDiscard{},
 	}
-	queueDrainAckAsyncStop("", store, sp, cr.cfg, "gc-worker", "worker", "", nil, &cr.asyncStops, &synchronizedBuffer{})
+	queueDrainAckAsyncStopForGeneration("", store, sp, cr.cfg, sessionID, "worker", "test-token", generation, nil, &cr.asyncStops, &synchronizedBuffer{})
 
 	select {
 	case <-sp.stopStarted:
@@ -1595,6 +1668,13 @@ func (p *reparentSurvivorProvider) Stop(name string) error {
 	return p.Fake.Stop(name)
 }
 
+func (p *reparentSurvivorProvider) StopIfCurrent(name string, identity runtime.Identity) (bool, error) {
+	p.stopMu.Lock()
+	p.stopped = true
+	p.stopMu.Unlock()
+	return p.Fake.StopIfCurrent(name, identity)
+}
+
 func (p *reparentSurvivorProvider) IsRunning(name string) bool {
 	p.stopMu.Lock()
 	stopped := p.stopped
@@ -1636,6 +1716,15 @@ func TestFinalizeDrainAckStopPendingSessionsConfirmsProcessNameSurvivor(t *testi
 	sp := &reparentSurvivorProvider{Fake: env.sp}
 
 	session := env.createSessionBead("worker", "worker")
+	for key, value := range map[string]string{
+		"GC_SESSION_ID":     session.ID,
+		"GC_RUNTIME_EPOCH":  session.Metadata["generation"],
+		"GC_INSTANCE_TOKEN": session.Metadata["instance_token"],
+	} {
+		if err := env.sp.SetMeta("worker", key, value); err != nil {
+			t.Fatalf("SetMeta(%s): %v", key, err)
+		}
+	}
 	patch := sessionpkg.DrainAckStopPendingPatch(env.clk.Now().UTC())
 	patch[poolManagedMetadataKey] = boolMetadata(true)
 	if err := env.store.SetMetadataBatch(session.ID, patch); err != nil {
@@ -1666,7 +1755,7 @@ func TestFinalizeDrainAckStopPendingSessionsConfirmsProcessNameSurvivor(t *testi
 			if call.Name == "worker" {
 				processAliveCalls++
 			}
-		case "Stop":
+		case "StopIfCurrent":
 			if call.Name == "worker" {
 				stopCalls++
 			}
@@ -1707,26 +1796,31 @@ func TestConfirmDrainAckRuntimeDeadTokenFenceStopsOnReplacement(t *testing.T) {
 	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	sessionID, generation := createDrainAckAsyncStopTestSession(t, store, sp, "original-token")
 	// A re-woken same-name replacement now owns the name with a fresh token.
 	if err := sp.SetMeta("worker", "GC_INSTANCE_TOKEN", "replacement-token"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
 	}
 
 	var stderr synchronizedBuffer
-	dead := confirmDrainAckRuntimeDead("", store, sp, &config.City{}, "worker", "original-token", []string{"claude"}, &stderr, drainAckStopConfirmDeadTimeout, drainAckStopConfirmDeadPoll)
+	dead := confirmDrainAckRuntimeDeadForGeneration("", store, sp, &config.City{}, sessionID, "worker", "original-token", generation, []string{"claude"}, &stderr, drainAckStopConfirmDeadTimeout, drainAckStopConfirmDeadPoll)
 	if !dead {
 		t.Fatal("confirm-dead must report the original target dead once a replacement owns the name")
 	}
+	conditionalCalled := false
 	for _, call := range sp.Calls {
-		if call.Method == "Stop" && call.Name == "worker" {
-			t.Fatal("confirm-dead re-killed a name-reused replacement instead of stopping on the token mismatch")
+		if call.Method == "StopIfCurrent" && call.Name == "worker" {
+			conditionalCalled = true
 		}
+		if call.Method == "Stop" && call.Name == "worker" {
+			t.Fatal("confirm-dead used an unconditional name stop against a replacement")
+		}
+	}
+	if !conditionalCalled {
+		t.Fatal("confirm-dead did not ask the provider to compare the runtime identity")
 	}
 	if !sp.IsRunning("worker") {
 		t.Fatal("confirm-dead killed the live replacement session")
-	}
-	if got := stderr.String(); !strings.Contains(got, "instance token mismatch") {
-		t.Fatalf("stderr = %q, want token mismatch diagnostic", got)
 	}
 }
 
@@ -2573,6 +2667,9 @@ func TestReconcileSessionBeads_DrainAckOwnDrainStepClosesWithoutEvent(t *testing
 	env.markSessionActive(&session)
 	if err := env.sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
 		t.Fatalf("Start(worker): %v", err)
+	}
+	if err := env.sp.SetMeta("worker", "GC_RUNTIME_EPOCH", "1"); err != nil {
+		t.Fatalf("SetMeta(GC_RUNTIME_EPOCH): %v", err)
 	}
 
 	root, err := env.store.Create(beads.Bead{
@@ -5027,6 +5124,16 @@ func (p *stopFailProvider) Stop(_ string) error {
 		}
 	}
 	return fmt.Errorf("stop failed: session unavailable")
+}
+
+func (p *stopFailProvider) StopIfCurrent(_ string, _ runtime.Identity) (bool, error) {
+	if p.stopCalled != nil {
+		select {
+		case p.stopCalled <- struct{}{}:
+		default:
+		}
+	}
+	return false, fmt.Errorf("stop failed: session unavailable")
 }
 
 func TestReconcileSessionBeads_DrainAckStopFailurePreservesMetadata(t *testing.T) {

@@ -66,3 +66,24 @@ evidence from tests, source, an issue, or a commit.
   Propagate that stale verdict to the provider-aware caller and clean up using
   the attempted identity outside the mutation lock. Persistence failure alone
   must not trigger runtime cleanup.
+- Interactive attach checks lifecycle before start and after the provider
+  terminal boundary. It must release the per-session mutation lock while the
+  terminal is attached, then reject success if the lifecycle or runtime
+  identity changed. Controller drain stops and confirm-dead re-kills recheck
+  the typed session generation, instance token, and drain state under the
+  process-local mutation lock, then require the provider's identity-conditional
+  stop to compare and stop the same runtime incarnation across processes.
+  A provider without that capability must fail closed. The instance token
+  alone cannot identify a replacement runtime because it is session-scoped.
+- A legacy runtime discovered during adoption has no safe provider-owned
+  binding to the newly created bead ID and generation unless the provider can
+  bind its immutable runtime handle atomically. Preserve its existing token,
+  mark the adoption unbound through the session create front door, and block
+  automatic conditional drain with an actionable unsupported-capability
+  error. Never fill provider ID/epoch metadata with sequential name-based
+  reads and writes.
+- Direct `gc session new` starts are fresh provider conversations even when
+  the provider accepts a generated session key. Route their rendered startup
+  prompt through the canonical argv, flag, or nudge policy before Provider.Start
+  and mark delivery only when a route was selected. A valid-key resume omits
+  that initial prompt so it is not replayed into the existing conversation.

@@ -105,10 +105,19 @@ func newEscalationEnv(t *testing.T) *escalationEnv {
 	// scanner discovers by, and the city attribution is what keeps a forced
 	// termination from reaching a sibling city.
 	if err := sp.Start(context.Background(), name, runtime.Config{Env: map[string]string{
-		"GC_SESSION_ID": bead.ID,
-		"GC_CITY_PATH":  cityPath,
+		"GC_SESSION_ID":     bead.ID,
+		"GC_CITY_PATH":      cityPath,
+		"GC_RUNTIME_EPOCH":  "3",
+		"GC_INSTANCE_TOKEN": "tok-a",
 	}}); err != nil {
 		t.Fatalf("start fake session: %v", err)
+	}
+	for key, value := range map[string]string{
+		"GC_SESSION_ID":     bead.ID,
+		"GC_RUNTIME_EPOCH":  "3",
+		"GC_INSTANCE_TOKEN": "tok-a",
+	} {
+		mustSetMeta(t, sp, name, key, value)
 	}
 	mustSetMeta(t, sp, name, reconcilerDrainAckSourceKey, drainAckSourceAgentValue)
 	mustSetMeta(t, sp, name, "GC_DRAIN_ACK", "1")
@@ -251,6 +260,7 @@ func (e *escalationEnv) seedInheritedEnvDaemonWithParent(pid, ppid int, comm str
 	e.sp.ExtraRuntimes = append(e.sp.ExtraRuntimes, runtime.LiveRuntime{
 		SessionID:    e.bead.ID,
 		City:         e.cityPath,
+		Epoch:        3,
 		PID:          pid,
 		PPID:         ppid,
 		Name:         comm,
@@ -267,6 +277,26 @@ func (e *escalationEnv) terminateCalls() int {
 		}
 	}
 	return n
+}
+
+func TestDrainAckForceTerminationTargetsForIdentitySkipsOtherEpochs(t *testing.T) {
+	identity := runtime.Identity{SessionID: "session-a", RuntimeEpoch: "3", InstanceToken: "token-a"}
+	found := []runtime.LiveRuntime{
+		{SessionID: "session-a", Epoch: 2, PID: 1002},
+		{SessionID: "session-a", Epoch: 3, PID: 1003},
+		{SessionID: "session-b", Epoch: 3, PID: 2003},
+	}
+	var stderr synchronizedBuffer
+	targets, skipped := drainAckForceTerminationTargetsForIdentity(found, identity, "worker", &stderr)
+	if len(targets) != 1 || targets[0].PID != 1003 {
+		t.Fatalf("identity-fenced targets = %#v, want only pid 1003", targets)
+	}
+	if skipped != 2 {
+		t.Fatalf("identity-fenced skipped = %d, want 2", skipped)
+	}
+	if got := stderr.String(); !strings.Contains(got, "epoch=2") || !strings.Contains(got, "session=\"session-b\"") {
+		t.Fatalf("identity mismatch diagnostics = %q, want both skipped process identities", got)
+	}
 }
 
 // spendReminderBudget drives the reminder arm to exhaustion. Only reachable
@@ -854,21 +884,31 @@ func TestEscalationPokesTheControllerWhenTheOrdinaryStopSucceeds(t *testing.T) {
 //
 // Without the recover this test does not fail, it CRASHES the test binary.
 func TestEscalationRecoversAPanicInTheDetachedTermination(t *testing.T) {
-	store := beads.NewMemStore()
+	e := newEscalationEnv(t)
 	sp := newPanicStopProvider()
-	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
-		t.Fatalf("Start(worker): %v", err)
+	if err := sp.Start(context.Background(), e.name, runtime.Config{Env: map[string]string{
+		"GC_SESSION_ID":     e.bead.ID,
+		"GC_RUNTIME_EPOCH":  "3",
+		"GC_INSTANCE_TOKEN": "tok-a",
+	}}); err != nil {
+		t.Fatalf("Start(%s): %v", e.name, err)
 	}
-	var stderr synchronizedBuffer
+	for key, value := range map[string]string{
+		"GC_SESSION_ID":     e.bead.ID,
+		"GC_RUNTIME_EPOCH":  "3",
+		"GC_INSTANCE_TOKEN": "tok-a",
+	} {
+		mustSetMeta(t, sp.Fake, e.name, key, value)
+	}
 	tracker := &asyncStartTracker{}
-	done, claimed := tracker.startDrainAckStop("escalate:id:sess-1")
+	done, claimed := tracker.startDrainAckStop("escalate:" + drainAckAsyncStopKey(e.bead.ID, e.name))
 	if !claimed {
 		t.Fatal("could not claim the termination slot")
 	}
 
 	queueDrainAckForcedTermination(
-		t.TempDir(), store, sp, &config.City{}, sessionpkg.Info{ID: "sess-1"}, "worker",
-		"agent_acked_runtime_survived", 1, time.Now(), nil, 0, done, nil, &stderr,
+		e.cityPath, e.store, sp, e.cfg, e.info(), e.name,
+		"agent_acked_runtime_survived", 1, time.Now(), nil, 0, done, e.rec, e.out,
 	)
 
 	select {
@@ -880,8 +920,8 @@ func TestEscalationRecoversAPanicInTheDetachedTermination(t *testing.T) {
 		t.Fatal("the termination slot was never released after the panic: done() must stay in the same deferred " +
 			"closure as the recover, or the escalation key is held forever and every later tick refuses this row")
 	}
-	got := stderr.String()
-	if !strings.Contains(got, "forced termination for worker panicked: stop exploded") {
+	got := e.out.String()
+	if !strings.Contains(got, "forced termination for "+e.name+" panicked: stop exploded") {
 		t.Fatalf("stderr = %q, want a panic diagnostic", got)
 	}
 	if !strings.Contains(got, "goroutine ") {

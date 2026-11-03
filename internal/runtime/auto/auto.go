@@ -7,6 +7,7 @@ package auto
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -26,6 +27,7 @@ type Provider struct {
 
 var (
 	_ runtime.Provider                      = (*Provider)(nil)
+	_ runtime.ConditionalStopProvider       = (*Provider)(nil)
 	_ runtime.DeadRuntimeSessionChecker     = (*Provider)(nil)
 	_ runtime.InteractionProvider           = (*Provider)(nil)
 	_ runtime.IdleSnapshotProvider          = (*Provider)(nil)
@@ -66,13 +68,26 @@ func (p *Provider) Unroute(name string) {
 }
 
 func (p *Provider) route(name string) runtime.Provider {
+	_, provider := p.routeSnapshot(name)
+	return provider
+}
+
+func (p *Provider) routeSnapshot(name string) (bool, runtime.Provider) {
 	p.mu.RLock()
 	isACP := p.routes[name]
 	p.mu.RUnlock()
 	if isACP {
-		return p.acpSP
+		return true, p.acpSP
 	}
-	return p.defaultSP
+	return false, p.defaultSP
+}
+
+func (p *Provider) unrouteIfCurrent(name string, expectedACP bool) {
+	p.mu.Lock()
+	if p.routes[name] == expectedACP {
+		delete(p.routes, name)
+	}
+	p.mu.Unlock()
 }
 
 // SupportsTransport reports whether this provider can route the requested
@@ -159,6 +174,62 @@ func (p *Provider) Stop(name string) error {
 		return nil
 	}
 	return mergedErr
+}
+
+// StopIfCurrent tries the routed backend first, then the other backend when
+// the first reports no matching runtime or lacks conditional-stop support. It
+// passes the same full identity to each backend and never falls back to a
+// name-only stop.
+func (p *Provider) StopIfCurrent(name string, identity runtime.Identity) (bool, error) {
+	isACP, primary := p.routeSnapshot(name)
+	primaryLabel, otherLabel, other := "default", "acp", p.acpSP
+	if isACP {
+		primaryLabel, otherLabel, other = "acp", "default", p.defaultSP
+	}
+	var primaryErr error
+	if stopper, ok := primary.(runtime.ConditionalStopProvider); ok {
+		stopped, err := stopper.StopIfCurrent(name, identity)
+		if stopped && err == nil {
+			p.unrouteIfCurrent(name, isACP)
+			return true, nil
+		}
+		if err != nil {
+			if stopped || (!runtime.IsSessionGone(err) && !errors.Is(err, runtime.ErrConditionalStopUnsupported)) {
+				return stopped, fmt.Errorf("%s backend conditional stop: %w", primaryLabel, err)
+			}
+			primaryErr = fmt.Errorf("%s backend conditional stop: %w", primaryLabel, err)
+		}
+	} else {
+		primaryErr = fmt.Errorf("%w: %s backend provider %T", runtime.ErrConditionalStopUnsupported, primaryLabel, primary)
+	}
+
+	stopper, ok := other.(runtime.ConditionalStopProvider)
+	if !ok {
+		otherErr := fmt.Errorf("%w: %s backend provider %T", runtime.ErrConditionalStopUnsupported, otherLabel, other)
+		if primaryErr != nil {
+			return false, errors.Join(primaryErr, otherErr)
+		}
+		return false, otherErr
+	}
+	stopped, err := stopper.StopIfCurrent(name, identity)
+	if stopped && err == nil {
+		p.unrouteIfCurrent(name, isACP)
+		return true, nil
+	}
+	if err == nil {
+		if errors.Is(primaryErr, runtime.ErrConditionalStopUnsupported) {
+			return false, primaryErr
+		}
+		return false, nil
+	}
+	if runtime.IsSessionGone(err) && !errors.Is(primaryErr, runtime.ErrConditionalStopUnsupported) {
+		return false, nil
+	}
+	otherErr := fmt.Errorf("%s backend conditional stop: %w", otherLabel, err)
+	if primaryErr != nil {
+		return false, errors.Join(primaryErr, otherErr)
+	}
+	return false, otherErr
 }
 
 // Interrupt delegates to the routed backend.

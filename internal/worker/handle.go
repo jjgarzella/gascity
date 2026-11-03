@@ -28,6 +28,12 @@ type StateHandle interface {
 	State(context.Context) (State, error)
 }
 
+// ConditionalKillHandle exposes an identity-fenced runtime stop for controller
+// cleanup paths that must not target a same-name replacement.
+type ConditionalKillHandle interface {
+	KillIfCurrent(context.Context, runtime.Identity) (bool, error)
+}
+
 // LifecycleHandle exposes worker lifecycle control operations.
 type LifecycleHandle interface {
 	Start(context.Context) error
@@ -321,6 +327,7 @@ type SessionHandle struct {
 var (
 	_ Handle                = (*SessionHandle)(nil)
 	_ LifecycleHandle       = (*SessionHandle)(nil)
+	_ ConditionalKillHandle = (*SessionHandle)(nil)
 	_ MessagingHandle       = (*SessionHandle)(nil)
 	_ TranscriptHandle      = (*SessionHandle)(nil)
 	_ HistoryHandle         = (*SessionHandle)(nil)

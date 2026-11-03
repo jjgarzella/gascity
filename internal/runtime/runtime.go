@@ -62,6 +62,14 @@ var ErrSessionDiedDuringStartup = errors.New("session died during startup")
 // dispatch with errors.Is.
 var ErrSessionNotFound = errors.New("session not found")
 
+// ErrConditionalStopUnsupported reports that a provider cannot atomically
+// target a runtime incarnation for a destructive stop.
+var ErrConditionalStopUnsupported = errors.New("runtime does not support identity-conditional stop")
+
+// ErrRuntimeIdentityRequired reports that an identity-conditional stop was
+// requested without every required runtime identity field.
+var ErrRuntimeIdentityRequired = errors.New("complete runtime identity is required")
+
 // ErrExecUnsupported reports that a provider implements [ExecProvider] but the
 // underlying runtime does not implement the RPP `exec` wire op (it answered
 // exit 2). Carriers treat this as "fall back to the legacy driving op".
@@ -246,6 +254,35 @@ type Provider interface {
 	// Capabilities reports what this provider can reliably detect.
 	// Used by the reconciler to skip inapplicable wake reasons.
 	Capabilities() ProviderCapabilities
+}
+
+// Identity identifies one session runtime incarnation. The epoch
+// changes when a session runtime is restarted; the instance token is an
+// additional durable-session fence when one is available, and must not be used
+// alone as an incarnation fence.
+type Identity struct {
+	SessionID     string
+	RuntimeEpoch  string
+	InstanceToken string
+}
+
+// IsComplete reports whether the session ID and runtime epoch needed for an
+// incarnation fence are set. InstanceToken may be empty for adopted runtimes
+// created before tokens were recorded; providers compare it exactly when it is
+// present in the identity.
+func (i Identity) IsComplete() bool {
+	return strings.TrimSpace(i.SessionID) != "" &&
+		strings.TrimSpace(i.RuntimeEpoch) != ""
+}
+
+// ConditionalStopProvider is an optional provider capability for destructive
+// lifecycle paths that must not stop a same-name replacement. StopIfCurrent
+// compares the supplied identity and stops only that incarnation within the
+// provider's lifecycle serialization boundary. It returns false when no
+// matching incarnation is present. Providers without a sound compare-and-stop
+// implementation must not satisfy this interface.
+type ConditionalStopProvider interface {
+	StopIfCurrent(name string, identity Identity) (bool, error)
 }
 
 // PendingInteraction describes a blocking interaction raised by a session.

@@ -220,14 +220,12 @@ func runAdoptionBarrier(
 				sessionName, slot)
 		}
 
-		// Capture the runtime's own live GC_INSTANCE_TOKEN rather than
-		// minting a new one. The adopted process was already launched with
-		// whatever token it has (or none); fabricating a different value
-		// here can never retroactively match it, which permanently fences
-		// the drain-ack token check (session_reconciler.go) from ever
-		// stopping this runtime (ga-lfr06j). An empty result is the
-		// existing "cannot verify identity" signal and fails that fence
-		// open, matching sessions adopted with no known token at all.
+		// Preserve the runtime's own live instance token rather than minting a
+		// replacement. The legacy runtime's session ID and epoch are not
+		// provider-bound to the new bead, and the provider API has no atomic
+		// immutable-handle adoption operation. Record that limitation on the
+		// session instead of writing provider identity by name or claiming the
+		// runtime is conditionally drainable.
 		liveInstanceToken, _ := sp.GetMeta(sessionName, "GC_INSTANCE_TOKEN")
 
 		// Build bead metadata. Config/live hashes are left empty —
@@ -253,9 +251,10 @@ func runAdoptionBarrier(
 		createSessionBead := func() error {
 			meta["synced_at"] = clk.Now().UTC().Format("2006-01-02T15:04:05Z07:00")
 			beadID, err := sessFront.CreateSession(sessionpkg.CreateSpec{
-				Title:     detail.AgentName,
-				AgentName: detail.AgentName,
-				Metadata:  meta,
+				Title:                      detail.AgentName,
+				AgentName:                  detail.AgentName,
+				Metadata:                   meta,
+				RuntimeIdentityDisposition: sessionpkg.RuntimeIdentityUnboundLegacy,
 			})
 			if err != nil {
 				return fmt.Errorf("creating session bead for %q: %w", sessionName, err)
@@ -288,6 +287,7 @@ func runAdoptionBarrier(
 			result.Skipped++
 			continue
 		}
+		fmt.Fprintf(stderr, "adoption barrier: adopted legacy runtime %q without provider-owned identity binding; automatic drain is blocked until its runtime identity is bound or it is safely retired\n", sessionName) //nolint:errcheck
 		result.Adopted++
 		result.Details = append(result.Details, detail)
 	}

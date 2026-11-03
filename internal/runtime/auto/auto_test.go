@@ -398,6 +398,93 @@ func TestIsRunningFallsThrough(t *testing.T) {
 	}
 }
 
+func TestStopIfCurrentFallsBackOnlyForMatchingIdentity(t *testing.T) {
+	identity := runtime.Identity{
+		SessionID:     "session-current",
+		RuntimeEpoch:  "2",
+		InstanceToken: "token-current",
+	}
+	seed := func(t *testing.T, provider *runtime.Fake, name string, id runtime.Identity) {
+		t.Helper()
+		if err := provider.Start(context.Background(), name, runtime.Config{}); err != nil {
+			t.Fatalf("Start(%q): %v", name, err)
+		}
+		for key, value := range map[string]string{
+			"GC_SESSION_ID":     id.SessionID,
+			"GC_RUNTIME_EPOCH":  id.RuntimeEpoch,
+			"GC_INSTANCE_TOKEN": id.InstanceToken,
+		} {
+			if err := provider.SetMeta(name, key, value); err != nil {
+				t.Fatalf("SetMeta(%s): %v", key, err)
+			}
+		}
+	}
+	assertConditionalOnly := func(t *testing.T, def, acp *runtime.Fake, name string) {
+		t.Helper()
+		if got := def.CountCalls("Stop", name); got != 0 {
+			t.Errorf("default name-only Stop calls = %d, want 0", got)
+		}
+		if got := acp.CountCalls("Stop", name); got != 0 {
+			t.Errorf("ACP name-only Stop calls = %d, want 0", got)
+		}
+	}
+
+	t.Run("missing route finds matching ACP runtime", func(t *testing.T) {
+		def, acp := runtime.NewFake(), runtime.NewFake()
+		p := New(def, acp)
+		seed(t, acp, "worker", identity)
+
+		stopped, err := p.StopIfCurrent("worker", identity)
+		if err != nil || !stopped {
+			t.Fatalf("StopIfCurrent = %t, %v; want true, nil", stopped, err)
+		}
+		if acp.IsRunning("worker") {
+			t.Fatal("matching ACP runtime is still running")
+		}
+		assertConditionalOnly(t, def, acp, "worker")
+	})
+
+	t.Run("stale ACP route finds matching default runtime", func(t *testing.T) {
+		def, acp := runtime.NewFake(), runtime.NewFake()
+		p := New(def, acp)
+		p.RouteACP("worker")
+		seed(t, def, "worker", identity)
+
+		stopped, err := p.StopIfCurrent("worker", identity)
+		if err != nil || !stopped {
+			t.Fatalf("StopIfCurrent = %t, %v; want true, nil", stopped, err)
+		}
+		if def.IsRunning("worker") {
+			t.Fatal("matching default runtime is still running")
+		}
+		assertConditionalOnly(t, def, acp, "worker")
+	})
+
+	t.Run("replacement on fallback backend survives", func(t *testing.T) {
+		def, acp := runtime.NewFake(), runtime.NewFake()
+		p := New(def, acp)
+		p.RouteACP("worker")
+		replacement := runtime.Identity{
+			SessionID:     "session-replacement",
+			RuntimeEpoch:  "3",
+			InstanceToken: "token-replacement",
+		}
+		seed(t, def, "worker", replacement)
+
+		stopped, err := p.StopIfCurrent("worker", identity)
+		if err != nil || stopped {
+			t.Fatalf("StopIfCurrent = %t, %v; want false, nil", stopped, err)
+		}
+		if !def.IsRunning("worker") {
+			t.Fatal("fallback backend replacement was stopped")
+		}
+		if p.route("worker") != acp {
+			t.Fatal("no-match conditional stop removed the stale route")
+		}
+		assertConditionalOnly(t, def, acp, "worker")
+	})
+}
+
 func TestIsDeadRuntimeSessionChecksUnroutedFallbackChecker(t *testing.T) {
 	defaultSP := runtime.NewFake()
 	acpSP := newDeadRuntimeCheckProvider()

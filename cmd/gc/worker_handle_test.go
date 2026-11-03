@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,13 +9,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
+	tmuxruntime "github.com/gastownhall/gascity/internal/runtime/tmux"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/gastownhall/gascity/internal/worker"
 )
 
@@ -940,6 +944,322 @@ func TestResolveWorkerRuntimeProviderWithConfigMetadataIdentifiesProviderSession
 	}
 	if got := resolved.Name; got != "agent-provider" {
 		t.Fatalf("agent resolved.Name = %q, want agent-provider", got)
+	}
+}
+
+func workerPromptFixture(t *testing.T, command, prompt string) (*config.City, session.Info, TemplateParams) {
+	t.Helper()
+	cityDir := t.TempDir()
+	promptPath := filepath.Join(cityDir, "prompts", "worker.md")
+	if err := os.MkdirAll(filepath.Dir(promptPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(promptPath, []byte(prompt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "prompt-city"},
+		Agents: []config.Agent{{
+			Name:           "worker",
+			Provider:       "fake-codex",
+			PromptTemplate: "prompts/worker.md",
+		}},
+		Providers: map[string]config.ProviderSpec{
+			"fake-codex": {
+				Command:           command,
+				PromptMode:        "arg",
+				ReadyPromptPrefix: "READY>",
+			},
+		},
+	}
+	info := session.Info{
+		Template:            "worker",
+		AgentName:           "worker",
+		WorkDir:             cityDir,
+		SessionName:         "prompt-worker",
+		SessionNameMetadata: "prompt-worker",
+	}
+	params := newAgentBuildParams(cfg.EffectiveCityName(), cityDir, cfg, nil, time.Now().UTC(), nil, nil)
+	tp, err := resolveTemplateForSessionBeadInfo(params, &cfg.Agents[0], "worker", nil, info)
+	if err != nil {
+		t.Fatalf("resolveTemplateForSessionBeadInfo: %v", err)
+	}
+	return cfg, info, tp
+}
+
+func TestWorkerSessionCreateDeliversStartupPromptForFreshSessions(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		sessionIDFlag string
+		prompt        string
+		oversized     bool
+	}{
+		{name: "without provider key", prompt: "Fresh direct starts need the configured prompt."},
+		{name: "with generated provider key", sessionIDFlag: "--session-id", prompt: "Fresh direct starts need the configured prompt."},
+		{name: "oversized prompt uses nudge", prompt: strings.Repeat("x", maxPromptSuffixRawBytes), oversized: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, fixtureInfo, rendered := workerPromptFixture(t, "/bin/echo", tc.prompt)
+			providerSpec := cfg.Providers["fake-codex"]
+			providerSpec.SessionIDFlag = tc.sessionIDFlag
+			cfg.Providers["fake-codex"] = providerSpec
+			resolved, err := config.ResolveProvider(&cfg.Agents[0], &cfg.Workspace, cfg.Providers, func(name string) (string, error) {
+				return name, nil
+			})
+			if err != nil {
+				t.Fatalf("resolve fake provider: %v", err)
+			}
+
+			sp := runtime.NewFake()
+			handle, err := newWorkerSessionHandleForResolvedRuntimeWithConfig(
+				fixtureInfo.WorkDir,
+				beads.NewMemStore(),
+				sp,
+				cfg,
+				fixtureInfo.Alias,
+				fixtureInfo.SessionName,
+				fixtureInfo.Template,
+				"direct startup",
+				resolved.CommandString(),
+				resolved.Name,
+				fixtureInfo.WorkDir,
+				"",
+				resolved,
+				map[string]string{"agent_name": fixtureInfo.AgentName},
+			)
+			if err != nil {
+				t.Fatalf("build direct session handle: %v", err)
+			}
+			info, err := handle.Create(context.Background(), worker.CreateModeStarted)
+			if err != nil {
+				t.Fatalf("create direct session: %v", err)
+			}
+			started := sp.LastStartConfig(info.SessionName)
+			if started == nil {
+				t.Fatal("provider Start was not called")
+			}
+			if !strings.Contains(rendered.Prompt, tc.prompt) {
+				t.Fatalf("rendered prompt omitted configured startup instructions (prompt bytes %d)", len(tc.prompt))
+			}
+			if tc.oversized {
+				if started.PromptSuffix != "" || started.PromptFlag != "" || !strings.Contains(started.Nudge, tc.prompt) {
+					t.Fatalf("oversized direct prompt route = suffix length %d flag %q nudge length %d; want nudge delivery", len(started.PromptSuffix), started.PromptFlag, len(started.Nudge))
+				}
+			} else if started.PromptSuffix == "" || started.PromptFlag != "" || started.Nudge != "" {
+				t.Fatalf("direct start prompt route = suffix %q flag %q nudge %q; want argv delivery", started.PromptSuffix, started.PromptFlag, started.Nudge)
+			}
+			if got := started.Env[startupPromptDeliveredEnv]; got != "1" {
+				t.Fatalf("direct startup delivery marker = %q, want 1", got)
+			}
+			if tc.sessionIDFlag != "" && !strings.Contains(started.Command, tc.sessionIDFlag) {
+				t.Fatalf("fresh direct command = %q, want generated session-key flag %q", started.Command, tc.sessionIDFlag)
+			}
+		})
+	}
+}
+
+func TestResolvedWorkerRuntimeFreshFallbackPromptDelivery(t *testing.T) {
+	cfg, info, rendered := workerPromptFixture(t, "/bin/echo", "Fresh bootstrap instructions.")
+	if !strings.Contains(rendered.Prompt, "Fresh bootstrap instructions.") {
+		t.Fatalf("rendered prompt = %q, want configured startup instructions", rendered.Prompt)
+	}
+
+	fresh, err := resolvedWorkerRuntimeWithConfig(info.WorkDir, cfg, info, "")
+	if err != nil {
+		t.Fatalf("resolve fresh fallback: %v", err)
+	}
+	if fresh.Hints.PromptSuffix == "" || fresh.Hints.PromptFlag != "" || fresh.Hints.Nudge != "" {
+		t.Fatalf("fresh prompt route = suffix %q flag %q nudge %q; want argv delivery", fresh.Hints.PromptSuffix, fresh.Hints.PromptFlag, fresh.Hints.Nudge)
+	}
+	if got := fresh.Hints.Env[startupPromptDeliveredEnv]; got != "1" {
+		t.Fatalf("fresh delivery marker = %q, want 1 so SessionStart does not duplicate the prompt", got)
+	}
+
+	resumeInfo := info
+	resumeInfo.SessionKey = "provider-session-key"
+	resumed, err := resolvedWorkerRuntimeWithConfig(info.WorkDir, cfg, resumeInfo, "")
+	if err != nil {
+		t.Fatalf("resolve valid resume: %v", err)
+	}
+	if resumed.Hints.PromptSuffix != "" || resumed.Hints.PromptFlag != "" || resumed.Hints.Nudge != "" {
+		t.Fatalf("valid resume received startup prompt route: suffix %q flag %q nudge %q", resumed.Hints.PromptSuffix, resumed.Hints.PromptFlag, resumed.Hints.Nudge)
+	}
+	if got := resumed.Hints.Env[startupPromptDeliveredEnv]; got != "" {
+		t.Fatalf("valid resume delivery marker = %q, want empty", got)
+	}
+}
+
+func TestResolvedWorkerRuntimeFreshFallbackOversizedPromptUsesNudge(t *testing.T) {
+	cfg, info, _ := workerPromptFixture(t, "/bin/echo", strings.Repeat("x", maxPromptSuffixRawBytes))
+	resolved, err := resolvedWorkerRuntimeWithConfig(info.WorkDir, cfg, info, "")
+	if err != nil {
+		t.Fatalf("resolve oversized fresh fallback: %v", err)
+	}
+	if resolved.Hints.PromptSuffix != "" || resolved.Hints.PromptFlag != "" {
+		t.Fatalf("oversized prompt used argv: suffix length %d flag %q", len(resolved.Hints.PromptSuffix), resolved.Hints.PromptFlag)
+	}
+	if !strings.Contains(resolved.Hints.Nudge, strings.Repeat("x", maxPromptSuffixRawBytes)) {
+		t.Fatalf("oversized prompt nudge length = %d, want configured prompt bytes", len(resolved.Hints.Nudge))
+	}
+	if got := resolved.Hints.Env[startupPromptDeliveredEnv]; got != "1" {
+		t.Fatalf("oversized nudge delivery marker = %q, want 1", got)
+	}
+}
+
+func TestResolvedWorkerRuntimeFreshFallbackPromptProviderReceipt(t *testing.T) {
+	skipSlowCmdGCTest(t, "starts a private tmux server; run make test-cmd-gc-process for full coverage")
+	cityDir := t.TempDir()
+	fakeCodex := filepath.Join(cityDir, "fake-codex")
+	argsReceipt := filepath.Join(cityDir, "provider-argv")
+	acceptedReceipt := filepath.Join(cityDir, "provider-accepted")
+	stdinReceipt := filepath.Join(cityDir, "provider-stdin")
+	markerReceipt := filepath.Join(cityDir, "provider-delivery-marker")
+	const directInstruction = "Fake Codex must receive the rendered startup prompt."
+	script := `#!/bin/sh
+set -eu
+printf '%s\0' "$@" > "$GC_PROVIDER_ARGV"
+last=
+for arg do last=$arg; done
+if [ -n "$last" ]; then printf 'accepted' > "$GC_PROVIDER_ACCEPTED"; else printf 'rejected' > "$GC_PROVIDER_ACCEPTED"; fi
+: > "$GC_PROVIDER_STDIN"
+printf '%s' "${GC_STARTUP_PROMPT_DELIVERED:-}" > "$GC_PROVIDER_MARKER"
+printf 'READY>\n'
+IFS= read -r ignored || true
+`
+	if err := os.WriteFile(fakeCodex, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg, info, rendered := workerPromptFixture(t, fakeCodex, directInstruction)
+	if !strings.Contains(rendered.Prompt, directInstruction) {
+		t.Fatalf("rendered prompt = %q, want configured fake-provider instruction", rendered.Prompt)
+	}
+	resolved, err := resolvedWorkerRuntimeWithConfig(info.WorkDir, cfg, info, "")
+	if err != nil {
+		t.Fatalf("resolve fresh fallback runtime: %v", err)
+	}
+	if resolved.Hints.PromptSuffix == "" || resolved.Hints.Nudge != "" {
+		t.Fatalf("selected fresh prompt route = suffix length %d, nudge length %d; want argv route", len(resolved.Hints.PromptSuffix), len(resolved.Hints.Nudge))
+	}
+	if got := resolved.Hints.Env[startupPromptDeliveredEnv]; got != "1" {
+		t.Fatalf("startup delivery marker = %q, want 1", got)
+	}
+	expectedArgs := shellquote.Split(resolved.Hints.PromptSuffix)
+	if len(expectedArgs) != 1 {
+		t.Fatalf("decode selected prompt suffix %q: args=%q", resolved.Hints.PromptSuffix, expectedArgs)
+	}
+
+	launch := resolved.Hints
+	launch.Command = resolved.Command
+	launch.WorkDir = info.WorkDir
+	launch.Env = make(map[string]string, len(resolved.Hints.Env)+4)
+	for key, value := range resolved.Hints.Env {
+		launch.Env[key] = value
+	}
+	launch.Env["GC_PROVIDER_ARGV"] = argsReceipt
+	launch.Env["GC_PROVIDER_ACCEPTED"] = acceptedReceipt
+	launch.Env["GC_PROVIDER_STDIN"] = stdinReceipt
+	launch.Env["GC_PROVIDER_MARKER"] = markerReceipt
+	socket := fmt.Sprintf("gcprompt-%d-%x", os.Getpid(), time.Now().UnixNano())
+	provider := tmuxruntime.NewProviderWithConfig(tmuxruntime.Config{SocketName: socket, SetupTimeout: 5 * time.Second})
+	const sessionName = "fresh-prompt-receipt"
+	defer func() {
+		_ = provider.Stop(sessionName)
+		_ = provider.TeardownServer()
+	}()
+	if err := provider.Start(context.Background(), sessionName, launch); err != nil {
+		t.Fatalf("provider Start: %v", err)
+	}
+
+	argv, err := os.ReadFile(argsReceipt)
+	if err != nil {
+		t.Fatalf("read provider argv receipt: %v", err)
+	}
+	args := bytes.Split(bytes.TrimSuffix(argv, []byte{0}), []byte{0})
+	if len(args) == 0 || string(args[len(args)-1]) != expectedArgs[0] {
+		t.Fatalf("fake Codex final argv = %q, want rendered prompt argument %q", args, expectedArgs[0])
+	}
+	accepted, err := os.ReadFile(acceptedReceipt)
+	if err != nil || string(accepted) != "accepted" {
+		t.Fatalf("fake Codex acceptance receipt = %q, %v; want accepted", accepted, err)
+	}
+	stdin, err := os.ReadFile(stdinReceipt)
+	if err != nil || len(stdin) != 0 {
+		t.Fatalf("fake Codex stdin receipt = %q, %v; want empty for argv delivery", stdin, err)
+	}
+	marker, err := os.ReadFile(markerReceipt)
+	if err != nil || string(marker) != "1" {
+		t.Fatalf("fake Codex startup delivery marker = %q, %v; want 1", marker, err)
+	}
+
+	// Exercise the direct CLI create path through the same fake process. This
+	// catches cases where the resolver builds a prompt route but the actual
+	// worker creation path fails to pass it to Provider.Start.
+	directArgsReceipt := filepath.Join(cityDir, "direct-provider-argv")
+	directAcceptedReceipt := filepath.Join(cityDir, "direct-provider-accepted")
+	directStdinReceipt := filepath.Join(cityDir, "direct-provider-stdin")
+	directMarkerReceipt := filepath.Join(cityDir, "direct-provider-delivery-marker")
+	providerSpec := cfg.Providers["fake-codex"]
+	providerSpec.SessionIDFlag = "--session-id"
+	providerSpec.Env = map[string]string{
+		"GC_PROVIDER_ARGV":     directArgsReceipt,
+		"GC_PROVIDER_ACCEPTED": directAcceptedReceipt,
+		"GC_PROVIDER_STDIN":    directStdinReceipt,
+		"GC_PROVIDER_MARKER":   directMarkerReceipt,
+	}
+	cfg.Providers["fake-codex"] = providerSpec
+	directResolved, err := config.ResolveProvider(&cfg.Agents[0], &cfg.Workspace, cfg.Providers, func(name string) (string, error) {
+		return name, nil
+	})
+	if err != nil {
+		t.Fatalf("resolve direct-create fake provider: %v", err)
+	}
+	directHandle, err := newWorkerSessionHandleForResolvedRuntimeWithConfig(
+		info.WorkDir,
+		beads.NewMemStore(),
+		provider,
+		cfg,
+		info.Alias,
+		"direct-prompt-receipt",
+		info.Template,
+		"direct startup receipt",
+		directResolved.CommandString(),
+		directResolved.Name,
+		info.WorkDir,
+		"",
+		directResolved,
+		map[string]string{"agent_name": info.AgentName},
+	)
+	if err != nil {
+		t.Fatalf("build direct-create worker handle: %v", err)
+	}
+	if _, err := directHandle.Create(context.Background(), worker.CreateModeStarted); err != nil {
+		t.Fatalf("create direct fake-provider session: %v", err)
+	}
+	directArgv, err := os.ReadFile(directArgsReceipt)
+	if err != nil {
+		t.Fatalf("read direct-create provider argv receipt: %v", err)
+	}
+	directArgs := bytes.Split(bytes.TrimSuffix(directArgv, []byte{0}), []byte{0})
+	if len(directArgs) < 3 || string(directArgs[0]) != "--session-id" || len(directArgs[1]) == 0 {
+		t.Fatalf("direct fake Codex argv = %q, want generated --session-id key before the prompt", directArgs)
+	}
+	foundPrompt := false
+	for _, arg := range directArgs {
+		if strings.Contains(string(arg), directInstruction) {
+			foundPrompt = true
+			break
+		}
+	}
+	if !foundPrompt {
+		t.Fatalf("direct fake Codex argv = %q, want rendered startup prompt instruction %q", directArgs, directInstruction)
+	}
+	directAccepted, err := os.ReadFile(directAcceptedReceipt)
+	if err != nil || string(directAccepted) != "accepted" {
+		t.Fatalf("direct fake Codex acceptance receipt = %q, %v; want accepted", directAccepted, err)
+	}
+	directMarker, err := os.ReadFile(directMarkerReceipt)
+	if err != nil || string(directMarker) != "1" {
+		t.Fatalf("direct fake Codex startup delivery marker = %q, %v; want 1", directMarker, err)
 	}
 }
 

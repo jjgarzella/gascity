@@ -1172,6 +1172,17 @@ func (h *sessionChaosHarness) assertStarted() {
 		h.failf("runtime %q not running after first reconcile", h.sessionName)
 	}
 	h.assertLastStartConfigMatches(b)
+	// runtime.Fake stores provider metadata separately from the Config.Env
+	// inherited by the fake process. Mirror the launched epoch into its GetMeta
+	// surface so generation-fenced drain tests observe the same identity that a
+	// live tmux provider reads from the session environment.
+	if start := h.env.sp.LastStartConfig(h.sessionName); start != nil {
+		if epoch := strings.TrimSpace(start.Env["GC_RUNTIME_EPOCH"]); epoch != "" {
+			if err := h.env.sp.SetMeta(h.sessionName, "GC_RUNTIME_EPOCH", epoch); err != nil {
+				h.failf("set fake runtime epoch metadata: %v", err)
+			}
+		}
+	}
 }
 
 type sessionChaosAction struct {

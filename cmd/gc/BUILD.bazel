@@ -1379,6 +1379,7 @@ go_test(
         "session_reconciler_drift_defer_test.go",
         "session_reconciler_drift_resume_test.go",
         "session_reconciler_fork_launch_test.go",
+        "session_reconciler_generation_fence_test.go",
         "session_reconciler_killsite_fold_test.go",
         "session_reconciler_named_collapse_test.go",
         "session_reconciler_observation_regression_test.go",

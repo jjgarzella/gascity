@@ -1,6 +1,10 @@
 package session
 
-import "github.com/gastownhall/gascity/internal/beads"
+import (
+	"fmt"
+
+	"github.com/gastownhall/gascity/internal/beads"
+)
 
 // CreateSpec captures the typed vocabulary for creating a session bead through
 // the front door. It is the byte-identical replacement for the inline
@@ -12,8 +16,8 @@ import "github.com/gastownhall/gascity/internal/beads"
 // [LabelSession, "agent:<AgentName>"] label pair — so no caller re-declares
 // that shape. The caller still assembles the metadata vocabulary (the create
 // sites build it inline from template/provider/pool inputs, which are not
-// session-domain concerns) and passes it verbatim as Metadata; CreateSession
-// does not interpret or mutate it.
+// session-domain concerns) and passes it verbatim as Metadata. The typed
+// RuntimeIdentityDisposition field adds its session-owned marker separately.
 type CreateSpec struct {
 	// ID, when non-empty, is the explicit bead id to assign (the pool create
 	// site pre-allocates an id for deterministic pool-session naming). When
@@ -31,6 +35,10 @@ type CreateSpec struct {
 
 	// Metadata is the assembled session-bead metadata map, written verbatim.
 	Metadata map[string]string
+
+	// RuntimeIdentityDisposition records an identity condition owned by the
+	// session domain. Empty leaves Metadata unchanged.
+	RuntimeIdentityDisposition RuntimeIdentityDisposition
 }
 
 // CreateSessionInfo creates a session bead from spec and returns the projected
@@ -57,12 +65,23 @@ type CreateSpec struct {
 // pinned across every backend by the beadstest conformance case
 // CreateEchoMatchesGetOnMetadata, not just by the memstore-backed oracle here.
 func (s *Store) CreateSessionInfo(spec CreateSpec) (Info, error) {
+	metadata := spec.Metadata
+	if spec.RuntimeIdentityDisposition != "" {
+		if spec.RuntimeIdentityDisposition != RuntimeIdentityUnboundLegacy {
+			return Info{}, fmt.Errorf("unsupported runtime identity disposition %q", spec.RuntimeIdentityDisposition)
+		}
+		metadata = make(map[string]string, len(spec.Metadata)+1)
+		for key, value := range spec.Metadata {
+			metadata[key] = value
+		}
+		metadata[MetadataRuntimeIdentityDisposition] = string(spec.RuntimeIdentityDisposition)
+	}
 	created, err := s.store.Create(beads.Bead{
 		ID:       spec.ID,
 		Title:    spec.Title,
 		Type:     BeadType,
 		Labels:   []string{LabelSession, "agent:" + spec.AgentName},
-		Metadata: spec.Metadata,
+		Metadata: metadata,
 	})
 	if err != nil {
 		return Info{}, err

@@ -132,7 +132,7 @@ type Config struct {
 	// a dedicated server. Empty means use the default tmux server.
 	SocketName string
 	// RuntimeDir is the city runtime root under which per-session
-	// diagnostics are persisted. Production sets it to
+	// diagnostics and lifecycle coordination locks are persisted. Production sets it to
 	// citylayout.RuntimePath(cityPath), which is "<city>/.gc" -- this doc
 	// said ".gc/runtime" and it was wrong, which is the same mistake gc
 	// doctor made when it went looking for these artifacts under

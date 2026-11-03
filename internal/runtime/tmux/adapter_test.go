@@ -89,6 +89,54 @@ func TestProvider_StartStopIsRunning(t *testing.T) {
 	}
 }
 
+func TestProvider_StopIfCurrentLeavesSameNameReplacement(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	cfg := DefaultConfig()
+	cfg.SocketName = testSocketName
+	p := NewProviderWithConfig(cfg)
+	name := fmt.Sprintf("gc-test-conditional-stop-%d", time.Now().UnixNano())
+	_ = p.Stop(name)
+	t.Cleanup(func() { _ = p.Stop(name) })
+
+	oldIdentity := runtime.Identity{SessionID: "session-old", RuntimeEpoch: "1", InstanceToken: "token-old"}
+	if err := p.Start(context.Background(), name, runtime.Config{Command: "sleep 300", Env: map[string]string{
+		"GC_SESSION_ID": oldIdentity.SessionID, "GC_RUNTIME_EPOCH": oldIdentity.RuntimeEpoch, "GC_INSTANCE_TOKEN": oldIdentity.InstanceToken,
+	}}); err != nil {
+		t.Fatalf("Start(old): %v", err)
+	}
+	if err := p.SetMeta(name, "GC_RUNTIME_EPOCH", "2"); err != nil {
+		t.Fatalf("SetMeta(new runtime epoch): %v", err)
+	}
+	if stopped, err := p.StopIfCurrent(name, oldIdentity); err != nil || stopped {
+		t.Fatalf("StopIfCurrent(stale epoch) = %t, %v; want false, nil", stopped, err)
+	}
+	if !p.IsRunning(name) {
+		t.Fatal("stale runtime epoch stop removed the current tmux session")
+	}
+	currentIdentity := runtime.Identity{SessionID: oldIdentity.SessionID, RuntimeEpoch: "2", InstanceToken: oldIdentity.InstanceToken}
+	if stopped, err := p.StopIfCurrent(name, currentIdentity); err != nil || !stopped {
+		t.Fatalf("StopIfCurrent(current epoch) = %t, %v; want true, nil", stopped, err)
+	}
+
+	newIdentity := runtime.Identity{SessionID: "session-new", RuntimeEpoch: "1", InstanceToken: "token-new"}
+	if err := p.Start(context.Background(), name, runtime.Config{Command: "sleep 300", Env: map[string]string{
+		"GC_SESSION_ID": newIdentity.SessionID, "GC_RUNTIME_EPOCH": newIdentity.RuntimeEpoch, "GC_INSTANCE_TOKEN": newIdentity.InstanceToken,
+	}}); err != nil {
+		t.Fatalf("Start(replacement): %v", err)
+	}
+	if stopped, err := p.StopIfCurrent(name, oldIdentity); err != nil || stopped {
+		t.Fatalf("StopIfCurrent(stale identity) = %t, %v; want false, nil", stopped, err)
+	}
+	if !p.IsRunning(name) {
+		t.Fatal("stale identity stop removed the same-name replacement")
+	}
+	if stopped, err := p.StopIfCurrent(name, newIdentity); err != nil || !stopped {
+		t.Fatalf("StopIfCurrent(replacement) = %t, %v; want true, nil", stopped, err)
+	}
+}
+
 func TestProvider_StartWithEnv(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")

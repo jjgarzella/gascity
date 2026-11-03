@@ -8,6 +8,7 @@ go_library(
         "composer_clear.go",
         "cutover.go",
         "interaction.go",
+        "lifecycle_lock.go",
         "process_group_unix.go",
         "process_group_windows.go",
         "process_signal.go",

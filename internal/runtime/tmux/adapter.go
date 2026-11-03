@@ -37,6 +37,7 @@ var instanceTokenReader = rand.Reader
 // Compile-time check.
 var (
 	_ runtime.Provider                      = (*Provider)(nil)
+	_ runtime.ConditionalStopProvider       = (*Provider)(nil)
 	_ runtime.DeadRuntimeSessionChecker     = (*Provider)(nil)
 	_ runtime.EnvironmentBatchProvider      = (*Provider)(nil)
 	_ runtime.ImmediateNudgeProvider        = (*Provider)(nil)
@@ -72,7 +73,12 @@ func NewProviderWithConfig(cfg Config) *Provider {
 // and runtime readiness polling. Steps are conditional on Config fields;
 // an agent with no startup hints gets fire-and-forget.
 func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) error {
-	var err error
+	lock, err := p.lockLifecycle(name)
+	if err != nil {
+		return fmt.Errorf("locking session %q start: %w", name, err)
+	}
+	defer func() { _ = lock.Close() }()
+
 	cfg.Env, err = ensureInstanceToken(cfg.Env)
 	if err != nil {
 		return fmt.Errorf("ensuring instance token: %w", err)
@@ -239,13 +245,21 @@ func (p *Provider) RunLive(name string, cfg runtime.Config) error {
 // re-stage files (those are provision-half and unchanged on a launch-only change),
 // and on failure it leaves the warm box in place rather than tearing it down.
 func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config) error {
+	lock, err := p.lockLifecycle(name)
+	if err != nil {
+		return fmt.Errorf("locking session %q relaunch: %w", name, err)
+	}
+	defer func() { _ = lock.Close() }()
+
 	// The runtime dir is what makes the startup-nudge and start-crash
 	// diagnostics reachable. Relaunch and RunLive passed "" here, so an
 	// unconfirmed startup nudge on this path was suppressed by
 	// launchOrchestration and then recorded nowhere: success returned with
 	// neither confirmed delivery nor the durable evidence that suppression
 	// is predicated on.
-	if err := doRelaunchSession(ctx, p.startOps(cfg, false), name, cfg, p.cfg.SetupTimeout); err != nil {
+	if err := doRelaunchSessionWithBeforeRespawn(ctx, p.startOps(cfg, false), name, cfg, p.cfg.SetupTimeout, func() error {
+		return p.publishRuntimeIdentity(name, cfg.Env)
+	}); err != nil {
 		return err
 	}
 	p.cache.Invalidate()
@@ -257,22 +271,78 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 // Invalidates the state cache after a successful stop so subsequent
 // IsRunning calls see the updated state immediately.
 func (p *Provider) Stop(name string) error {
-	p.tm.CloseHiddenAttachClient(name)
-	// Exclude the calling process from the kill set. When `gc session close`
-	// runs from inside the pane it is tearing down (the self-close path), the
-	// caller is a descendant of the pane leader; without exclusion it would be
-	// SIGTERMed mid-cleanup, leaving the agent alive and the bead un-closed.
-	// Excluding a caller that lives outside the pane is a harmless no-op.
-	err := p.tm.KillSessionWithProcessesExcluding(name, []string{strconv.Itoa(os.Getpid())})
-	if err != nil && (errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer)) {
-		return nil // idempotent
+	lock, err := p.lockLifecycle(name)
+	if err != nil {
+		return fmt.Errorf("locking session %q stop: %w", name, err)
 	}
-	if err == nil {
-		// Immediately remove from cache so IsRunning reflects the kill
-		// without waiting for an async refresh cycle.
-		p.cache.EvictSession(name)
-	}
+	defer func() { _ = lock.Close() }()
+	_, err = p.stopTargetLocked(name, name)
 	return err
+}
+
+// StopIfCurrent stops only the runtime incarnation matching identity. The
+// cross-process lifecycle lock is shared with Start, Relaunch, and identity
+// metadata writes; the captured tmux session ID keeps a same-name replacement
+// outside the final kill target.
+func (p *Provider) StopIfCurrent(name string, identity runtime.Identity) (bool, error) {
+	if !identity.IsComplete() {
+		return false, runtime.ErrRuntimeIdentityRequired
+	}
+	lock, err := p.lockLifecycle(name)
+	if err != nil {
+		return false, fmt.Errorf("locking session %q conditional stop: %w", name, err)
+	}
+	defer func() { _ = lock.Close() }()
+
+	sessions, err := p.tm.ListSessionIDs()
+	if err != nil {
+		if errors.Is(err, ErrNoServer) {
+			return false, nil
+		}
+		return false, fmt.Errorf("listing tmux sessions before conditional stop: %w", err)
+	}
+	target, ok := sessions[name]
+	if !ok || strings.TrimSpace(target) == "" {
+		return false, nil
+	}
+	for key, expected := range map[string]string{
+		"GC_SESSION_ID":     identity.SessionID,
+		"GC_RUNTIME_EPOCH":  identity.RuntimeEpoch,
+		"GC_INSTANCE_TOKEN": identity.InstanceToken,
+	} {
+		actual, err := p.tm.GetEnvironment(target, key)
+		if err != nil {
+			switch {
+			case errors.Is(err, errEnvUnset):
+				actual = ""
+			case errors.Is(err, ErrNoServer), errors.Is(err, ErrSessionNotFound):
+				return false, nil
+			default:
+				return false, fmt.Errorf("reading %s for conditional stop of %q: %w", key, name, err)
+			}
+		}
+		if strings.TrimSpace(actual) != strings.TrimSpace(expected) {
+			return false, nil
+		}
+	}
+	return p.stopTargetLocked(name, target)
+}
+
+// stopTargetLocked destroys target, which is either the name for an ordinary
+// serialized stop or the captured tmux session ID for a conditional stop.
+func (p *Provider) stopTargetLocked(name, target string) (bool, error) {
+	p.tm.CloseHiddenAttachClient(name)
+	// Exclude the calling process from the kill set. A close invoked inside the
+	// pane must survive long enough to finish its own cleanup.
+	err := p.tm.KillSessionWithProcessesExcluding(target, []string{strconv.Itoa(os.Getpid())})
+	if err != nil && (errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer)) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	p.cache.EvictSession(name)
+	return true, nil
 }
 
 // Interrupt sends Ctrl-C to the named tmux session.
@@ -633,8 +703,31 @@ func (p *Provider) NudgeNow(name string, content []runtime.ContentBlock) error {
 	return err
 }
 
+// publishRuntimeIdentity refreshes the provider-visible incarnation before a
+// relaunch changes the pane process. The caller holds the shared lifecycle lock.
+func (p *Provider) publishRuntimeIdentity(name string, env map[string]string) error {
+	for _, key := range []string{"GC_SESSION_ID", "GC_RUNTIME_EPOCH", "GC_INSTANCE_TOKEN"} {
+		value, ok := env[key]
+		if !ok || strings.TrimSpace(value) == "" {
+			continue
+		}
+		if err := p.tm.SetEnvironment(name, key, value); err != nil {
+			return fmt.Errorf("setting %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
 // SetMeta stores a key-value pair in the named session's tmux environment.
 func (p *Provider) SetMeta(name, key, value string) error {
+	if !runtimeIdentityMetaKey(key) {
+		return p.tm.SetEnvironment(name, key, value)
+	}
+	lock, err := p.lockLifecycle(name)
+	if err != nil {
+		return fmt.Errorf("locking session %q metadata update: %w", name, err)
+	}
+	defer func() { _ = lock.Close() }()
 	return p.tm.SetEnvironment(name, key, value)
 }
 
@@ -659,6 +752,14 @@ func (p *Provider) GetMeta(name, key string) (string, error) {
 
 // RemoveMeta removes a key from the named session's tmux environment.
 func (p *Provider) RemoveMeta(name, key string) error {
+	if !runtimeIdentityMetaKey(key) {
+		return p.tm.RemoveEnvironment(name, key)
+	}
+	lock, err := p.lockLifecycle(name)
+	if err != nil {
+		return fmt.Errorf("locking session %q metadata removal: %w", name, err)
+	}
+	defer func() { _ = lock.Close() }()
 	return p.tm.RemoveEnvironment(name, key)
 }
 
@@ -1466,6 +1567,10 @@ func finishLaunch(ctx context.Context, ops startOps, name string, cfg runtime.Co
 // reconciler decides whether to Provision first). On a respawn failure the warm
 // box is left in place so the caller can retry or reprovision.
 func doRelaunchSession(ctx context.Context, ops startOps, name string, cfg runtime.Config, setupTimeout time.Duration) error {
+	return doRelaunchSessionWithBeforeRespawn(ctx, ops, name, cfg, setupTimeout, nil)
+}
+
+func doRelaunchSessionWithBeforeRespawn(ctx context.Context, ops startOps, name string, cfg runtime.Config, setupTimeout time.Duration, beforeRespawn func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1492,6 +1597,11 @@ func doRelaunchSession(ctx context.Context, ops startOps, name string, cfg runti
 	fullCommand, promptFile, err := buildLaunchCommand(name, cfg)
 	if err != nil {
 		return err
+	}
+	if beforeRespawn != nil {
+		if err := beforeRespawn(); err != nil {
+			return fmt.Errorf("relaunch: publishing runtime identity: %w", err)
+		}
 	}
 	if err := ops.respawnAgent(name, cfg.WorkDir, fullCommand, cfg.Env); err != nil {
 		return cleanupPromptFileOnError(promptFile, fmt.Errorf("relaunch: respawning agent in session %q: %w", name, err))

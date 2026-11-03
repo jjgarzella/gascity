@@ -117,6 +117,40 @@ func TestStart_HandshakeSuccess(t *testing.T) {
 	}
 }
 
+func TestStopIfCurrentRejectsStaleIdentityAndStopsCurrent(t *testing.T) {
+	p := newTestProvider(t)
+	name := testName()
+	oldIdentity := runtime.Identity{SessionID: "session-old", RuntimeEpoch: "1", InstanceToken: "token-old"}
+	if err := p.Start(context.Background(), name, runtime.Config{
+		Command: fakeACPShellCommand(),
+		WorkDir: t.TempDir(),
+		Env: map[string]string{
+			"GC_SESSION_ID":     oldIdentity.SessionID,
+			"GC_RUNTIME_EPOCH":  oldIdentity.RuntimeEpoch,
+			"GC_INSTANCE_TOKEN": oldIdentity.InstanceToken,
+		},
+	}); err != nil {
+		t.Fatalf("Start(old): %v", err)
+	}
+	t.Cleanup(func() { _ = p.Stop(name) })
+
+	staleIdentity := oldIdentity
+	staleIdentity.RuntimeEpoch = "0"
+	if stopped, err := p.StopIfCurrent(name, staleIdentity); err != nil || stopped {
+		t.Fatalf("StopIfCurrent(stale) = %t, %v; want false, nil", stopped, err)
+	}
+	if !p.IsRunning(name) {
+		t.Fatal("stale conditional stop removed the current ACP session")
+	}
+
+	if stopped, err := p.StopIfCurrent(name, oldIdentity); err != nil || !stopped {
+		t.Fatalf("StopIfCurrent(current) = %t, %v; want true, nil", stopped, err)
+	}
+	if p.IsRunning(name) {
+		t.Fatal("matching conditional stop left the ACP session running")
+	}
+}
+
 func TestStart_EmptyEnvOverrideIsAbsentFromAgent(t *testing.T) {
 	t.Setenv("BEADS_DB", "ambient-database")
 	t.Setenv("BEADS_DOLT_SERVER_HOST", "ambient.example")

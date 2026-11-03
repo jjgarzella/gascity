@@ -1049,6 +1049,9 @@ func TestReconcileSessionBeads_DrainingSeatsBelongToTheStopPendingHandler(t *tes
 		if err := env.sp.Start(context.Background(), poolSeatName, runtime.Config{Command: "test-cmd"}); err != nil {
 			t.Fatalf("start: %v", err)
 		}
+		if err := env.sp.SetMeta(poolSeatName, "GC_RUNTIME_EPOCH", "1"); err != nil {
+			t.Fatalf("SetMeta(GC_RUNTIME_EPOCH): %v", err)
+		}
 		return seat
 	}
 

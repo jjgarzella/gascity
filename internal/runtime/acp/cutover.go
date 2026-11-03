@@ -14,6 +14,7 @@ type seamBackedProvider struct {
 
 var (
 	_ runtime.Provider                    = (*seamBackedProvider)(nil)
+	_ runtime.ConditionalStopProvider     = (*seamBackedProvider)(nil)
 	_ runtime.InteractionProvider         = (*seamBackedProvider)(nil)
 	_ runtime.TransportCapabilityProvider = (*seamBackedProvider)(nil)
 	_ runtime.SleepCapabilityProvider     = (*seamBackedProvider)(nil)
@@ -30,6 +31,11 @@ func NewSeamBackedWithDir(dir string, cfg Config) runtime.Provider {
 func seamBack(raw *Provider) *seamBackedProvider {
 	rt, tp := raw.Seams()
 	return &seamBackedProvider{Provider: runtime.NewProviderFromSeams(rt, tp), raw: raw}
+}
+
+// StopIfCurrent forwards the cross-process conditional stop to the raw provider.
+func (s *seamBackedProvider) StopIfCurrent(name string, identity runtime.Identity) (bool, error) {
+	return s.raw.StopIfCurrent(name, identity)
 }
 
 // Pending implements [runtime.InteractionProvider] (non-seam passthrough).

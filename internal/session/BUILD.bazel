@@ -95,6 +95,7 @@ go_test(
         "kill_fence_test.go",
         "lifecycle_actor_test.go",
         "lifecycle_exits_test.go",
+        "lifecycle_generation_test.go",
         "lifecycle_holder_token_test.go",
         "lifecycle_identity_released_info_test.go",
         "lifecycle_input_test.go",

@@ -71,6 +71,7 @@ type Provider struct {
 // Compile-time check.
 var (
 	_ runtime.Provider                    = (*Provider)(nil)
+	_ runtime.ConditionalStopProvider     = (*Provider)(nil)
 	_ runtime.InteractionProvider         = (*Provider)(nil)
 	_ runtime.TransportCapabilityProvider = (*Provider)(nil)
 )
@@ -157,7 +158,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	p.cleanupMeta(name)
 	seedMeta, _ := runtime.SplitEnvForMetaSeed(cfg.Env)
 	for key, value := range seedMeta {
-		if err := p.SetMeta(name, key, value); err != nil {
+		if err := p.setMeta(name, key, value); err != nil {
 			p.cleanupMeta(name)
 			p.mu.Unlock()
 			return fmt.Errorf("seeding metadata for %q (%s): %w", name, key, err)
@@ -521,7 +522,11 @@ func (p *Provider) Stop(name string) error {
 		return err
 	}
 	defer lock.Close() //nolint:errcheck
+	return p.stopLocked(name)
+}
 
+// stopLocked stops the named session while the caller holds its lifecycle lock.
+func (p *Provider) stopLocked(name string) error {
 	p.mu.Lock()
 	sc, ok := p.conns[name]
 	if ok && !sc.alive() && p.socketAlive(name) {
@@ -555,12 +560,43 @@ func (p *Provider) Stop(name string) error {
 	}
 
 	// Fall back to socket (cross-process case).
-	err = p.stopBySocket(name)
+	err := p.stopBySocket(name)
 	if err == nil || runtime.IsSessionGone(err) {
 		p.cleanupMeta(name)
 		return nil
 	}
 	return err
+}
+
+// StopIfCurrent stops only the ACP incarnation matching the supplied identity.
+// Start and StopIfCurrent share the kernel-held per-name lifecycle lock, so a
+// replacement cannot publish new sidecar identity between comparison and stop.
+func (p *Provider) StopIfCurrent(name string, identity runtime.Identity) (bool, error) {
+	if !identity.IsComplete() {
+		return false, runtime.ErrRuntimeIdentityRequired
+	}
+	lock, err := p.lockLifecycle(name, false)
+	if err != nil {
+		return false, err
+	}
+	defer lock.Close() //nolint:errcheck
+	for key, expected := range map[string]string{
+		"GC_SESSION_ID":     identity.SessionID,
+		"GC_RUNTIME_EPOCH":  identity.RuntimeEpoch,
+		"GC_INSTANCE_TOKEN": identity.InstanceToken,
+	} {
+		actual, err := p.GetMeta(name, key)
+		if err != nil {
+			return false, fmt.Errorf("reading %s before conditional stop of %q: %w", key, name, err)
+		}
+		if strings.TrimSpace(actual) != strings.TrimSpace(expected) {
+			return false, nil
+		}
+	}
+	if err := p.stopLocked(name); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Interrupt sends SIGINT to the named session's process.
@@ -751,10 +787,31 @@ func (p *Provider) Peek(name string, lines int) (string, error) {
 // write rather than trusted from construction: a squatted directory is not
 // something a constructor can report.
 func (p *Provider) SetMeta(name, key, value string) error {
+	if !isRuntimeIdentityMetaKey(key) {
+		return p.setMeta(name, key, value)
+	}
+	lock, err := p.lockLifecycle(name, false)
+	if err != nil {
+		return err
+	}
+	defer lock.Close() //nolint:errcheck
+	return p.setMeta(name, key, value)
+}
+
+func (p *Provider) setMeta(name, key, value string) error {
 	if err := runtime.EnsurePrivateDir(p.dir); err != nil {
 		return err
 	}
 	return runtime.WritePrivateFile(p.metaPath(name, key), []byte(value))
+}
+
+func isRuntimeIdentityMetaKey(key string) bool {
+	switch key {
+	case "GC_SESSION_ID", "GC_RUNTIME_EPOCH", "GC_INSTANCE_TOKEN":
+		return true
+	default:
+		return false
+	}
 }
 
 // GetMeta retrieves a metadata value from a sidecar file.
@@ -772,6 +829,18 @@ func (p *Provider) GetMeta(name, key string) (string, error) {
 
 // RemoveMeta removes a metadata sidecar file.
 func (p *Provider) RemoveMeta(name, key string) error {
+	if !isRuntimeIdentityMetaKey(key) {
+		return p.removeMeta(name, key)
+	}
+	lock, err := p.lockLifecycle(name, false)
+	if err != nil {
+		return err
+	}
+	defer lock.Close() //nolint:errcheck
+	return p.removeMeta(name, key)
+}
+
+func (p *Provider) removeMeta(name, key string) error {
 	err := os.Remove(p.metaPath(name, key))
 	if os.IsNotExist(err) {
 		return nil

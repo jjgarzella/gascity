@@ -720,3 +720,59 @@ func TestFakeTerminateRuntime_BrokenError(t *testing.T) {
 		t.Error("OrphanedRuntimes entry removed despite error from broken fake")
 	}
 }
+
+func TestFakeStopIfCurrentComparesAndStopsRuntimeIdentityAtomically(t *testing.T) {
+	f := NewFake()
+	if err := f.Start(context.Background(), "worker", Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	identity := Identity{SessionID: "session-a", RuntimeEpoch: "1", InstanceToken: "token-a"}
+	for key, value := range map[string]string{
+		"GC_SESSION_ID": identity.SessionID, "GC_RUNTIME_EPOCH": identity.RuntimeEpoch, "GC_INSTANCE_TOKEN": identity.InstanceToken,
+	} {
+		if err := f.SetMeta("worker", key, value); err != nil {
+			t.Fatalf("SetMeta(%s): %v", key, err)
+		}
+	}
+	replacement := identity
+	replacement.RuntimeEpoch = "2"
+	if stopped, err := f.StopIfCurrent("worker", replacement); err != nil || stopped {
+		t.Fatalf("StopIfCurrent(replacement) = %t, %v; want false, nil", stopped, err)
+	}
+	if !f.IsRunning("worker") {
+		t.Fatal("identity mismatch stopped the current runtime")
+	}
+	if stopped, err := f.StopIfCurrent("worker", identity); err != nil || !stopped {
+		t.Fatalf("StopIfCurrent(current) = %t, %v; want true, nil", stopped, err)
+	}
+	if f.IsRunning("worker") {
+		t.Fatal("matching runtime identity remained running")
+	}
+}
+
+func TestFakeStopIfCurrentRequiresCompleteRuntimeIdentity(t *testing.T) {
+	f := NewFake()
+	if stopped, err := f.StopIfCurrent("worker", Identity{SessionID: "session-a"}); stopped || !errors.Is(err, ErrRuntimeIdentityRequired) {
+		t.Fatalf("StopIfCurrent(incomplete) = %t, %v; want false, ErrRuntimeIdentityRequired", stopped, err)
+	}
+}
+
+func TestFakeStopIfCurrentAllowsTokenlessAdoptedRuntime(t *testing.T) {
+	f := NewFake()
+	if err := f.Start(context.Background(), "worker", Config{Env: map[string]string{
+		"GC_SESSION_ID":    "session-a",
+		"GC_RUNTIME_EPOCH": "3",
+	}}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := f.SetMeta("worker", "GC_SESSION_ID", "session-a"); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+	if err := f.SetMeta("worker", "GC_RUNTIME_EPOCH", "3"); err != nil {
+		t.Fatalf("SetMeta(GC_RUNTIME_EPOCH): %v", err)
+	}
+	stopped, err := f.StopIfCurrent("worker", Identity{SessionID: "session-a", RuntimeEpoch: "3"})
+	if err != nil || !stopped {
+		t.Fatalf("StopIfCurrent(tokenless adopted runtime) = %t, %v; want true, nil", stopped, err)
+	}
+}

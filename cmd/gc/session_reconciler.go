@@ -439,17 +439,21 @@ func drainAckAsyncStopKey(sessionID, name string) string {
 }
 
 // drainAckAsyncStopPokeController is a mutable test seam over pokeController
-// for the async drain-ack stop path (see queueDrainAckAsyncStop).
+// for the async drain-ack stop path (see queueDrainAckAsyncStopForGeneration).
 var drainAckAsyncStopPokeController = pokeController
 
 // drainAckStopConfirmDeadTimeout/Poll bound the post-kill confirm-dead loop in
-// queueDrainAckAsyncStop. Package vars so tests can shrink them.
+// queueDrainAckAsyncStopForGeneration. Package vars so tests can shrink them.
 var (
 	drainAckStopConfirmDeadTimeout = 6 * time.Second
 	drainAckStopConfirmDeadPoll    = 250 * time.Millisecond
 )
 
-func queueDrainAckAsyncStop(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, sessionID, name, expectedToken string, processNames []string, tracker *asyncStartTracker, stderr io.Writer) {
+func queueDrainAckAsyncStopForGeneration(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, sessionID, name, expectedToken, expectedGeneration string, processNames []string, tracker *asyncStartTracker, stderr io.Writer) {
+	queueDrainAckAsyncStopCore(cityPath, store, sp, cfg, sessionID, name, expectedToken, sessionRuntimeGeneration(expectedGeneration), processNames, tracker, stderr)
+}
+
+func queueDrainAckAsyncStopCore(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, sessionID, name, expectedToken, expectedGeneration string, processNames []string, tracker *asyncStartTracker, stderr io.Writer) {
 	name = strings.TrimSpace(name)
 	if name == "" || sp == nil {
 		return
@@ -481,21 +485,18 @@ func queueDrainAckAsyncStop(cityPath string, store beads.Store, sp runtime.Provi
 			}
 			done()
 		}()
-		// Token fence (mirrors verifiedStop): this kill targets the session by
-		// NAME and may fire long after it was queued. If the name was reused by
-		// a re-woken replacement in the meantime, its GC_INSTANCE_TOKEN differs
-		// from the one we intended to stop; killing it would take out a live,
-		// working session. Skip on a definite mismatch. An empty expected or
-		// live token means "cannot verify" and falls through to the kill,
-		// matching verifiedStop's conservative posture.
-		if expectedToken != "" {
-			if actualToken, _ := sp.GetMeta(name, "GC_INSTANCE_TOKEN"); actualToken != "" && actualToken != expectedToken {
-				fmt.Fprintf(stderr, "session reconciler: async drain-ack stop %s skipped: instance token mismatch (session was replaced)\n", name) //nolint:errcheck
-				return
+		// The typed drain state and generation are rechecked before each provider
+		// compare-and-stop. No token-only or name-only fallback is safe across
+		// independent CLI/controller processes.
+		stopped, err := stopDrainAckRuntimeIfCurrent(cityPath, store, sp, cfg, sessionID, name, expectedToken, expectedGeneration)
+		if err != nil {
+			if !runtime.IsSessionGone(err) {
+				fmt.Fprintf(stderr, "session reconciler: async drain-ack stop %s: %v\n", name, err) //nolint:errcheck
 			}
+			return
 		}
-		if err := workerKillSessionTargetWithConfig(cityPath, store, sp, cfg, name); err != nil && !runtime.IsSessionGone(err) {
-			fmt.Fprintf(stderr, "session reconciler: async drain-ack stop %s: %v\n", name, err) //nolint:errcheck
+		if !stopped {
+			fmt.Fprintf(stderr, "session reconciler: async drain-ack stop %s skipped: session or runtime identity changed\n", name) //nolint:errcheck
 			return
 		}
 		// The kill above is best-effort and does not verify the agent actually
@@ -506,7 +507,7 @@ func queueDrainAckAsyncStop(cityPath string, store beads.Store, sp runtime.Provi
 		// (the reassigned next step stays runtime-missing). The expected token is
 		// threaded through so each re-kill stays fenced against a re-woken
 		// same-name replacement. Mirrors #4089's confirm-dead contract.
-		confirmDrainAckRuntimeDead(cityPath, store, sp, cfg, name, expectedToken, processNames, stderr, confirmTimeout, confirmPoll)
+		confirmDrainAckRuntimeDeadForGeneration(cityPath, store, sp, cfg, sessionID, name, expectedToken, expectedGeneration, processNames, stderr, confirmTimeout, confirmPoll)
 		// The runtime session is now confirmed dead (or the confirm-dead
 		// deadline passed and we proceed best-effort), but its pool session
 		// bead stays open (occupying the pool slot) until
@@ -523,22 +524,50 @@ func queueDrainAckAsyncStop(cityPath string, store beads.Store, sp runtime.Provi
 	}()
 }
 
-// confirmDrainAckRuntimeDead re-observes a killed runtime and re-issues the
-// kill until liveness is false or the deadline passes. The async drain-ack
-// stop's kill is best-effort and does not verify the agent exited; a survivor
-// keeps the pool slot occupied so the reassigned next step stays
-// runtime-missing. Each re-kill is token-fenced against expectedToken (mirrors
-// verifiedStop and the first-kill fence): session names are reused across
-// incarnations, so once the original target dies a re-woken same-name
-// replacement must not be killed. Returns true if confirmed dead — including
-// when a definite token mismatch shows the name now belongs to a replacement —
-// and false if it outlived the deadline (caller proceeds best-effort). Mirrors
-// #4089's confirm-dead contract.
+func sessionRuntimeGeneration(raw string) string {
+	return sessionpkg.CanonicalRuntimeGeneration(raw)
+}
+
+// stopDrainAckRuntimeIfCurrent stops only the generation the reconciler
+// observed. The process-local mutation lock keeps this controller's row check
+// coherent; the provider's conditional stop is the cross-process fence against
+// a same-name runtime replacement.
+func stopDrainAckRuntimeIfCurrent(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, sessionID, name, expectedToken, expectedGeneration string) (bool, error) {
+	stopped := false
+	err := sessionpkg.WithSessionMutationLock(sessionID, func() error {
+		info, err := sessionpkg.NewStore(beads.SessionStore{Store: store}).Get(sessionID)
+		if err != nil {
+			return fmt.Errorf("reading drain-ack session before stop: %w", err)
+		}
+		if sessionRuntimeGeneration(info.Generation) != expectedGeneration || info.InstanceToken != expectedToken ||
+			strings.TrimSpace(info.SessionNameMetadata) != name || !isDrainAckStopPendingInfo(info) {
+			return nil
+		}
+		identity := runtime.Identity{
+			SessionID:     sessionID,
+			RuntimeEpoch:  expectedGeneration,
+			InstanceToken: expectedToken,
+		}
+		stopped, err = workerKillSessionIfCurrentWithConfig(cityPath, store, sp, cfg, sessionID, identity)
+		return err
+	})
+	return stopped, err
+}
+
+// confirmDrainAckRuntimeDeadForGeneration re-observes a killed runtime and
+// re-issues the identity-conditional stop until liveness is false or the
+// deadline passes. The async drain-ack stop's kill is best-effort and does not
+// verify the agent exited; a survivor keeps the pool slot occupied so the
+// reassigned next step stays runtime-missing. The durable session row and
+// provider runtime epoch are rechecked on every re-kill, so a name reused by a
+// replacement is never the target. Returns true if confirmed dead or the
+// observed generation is no longer current, and false if the original runtime
+// outlived the deadline. Mirrors #4089's confirm-dead contract.
 //
 // timeout/poll are passed in rather than read from the package globals so a
 // detached caller can bind them on its own goroutine at queue time; see
-// queueDrainAckAsyncStop. Synchronous callers pass the globals directly.
-func confirmDrainAckRuntimeDead(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, name, expectedToken string, processNames []string, stderr io.Writer, timeout, poll time.Duration) bool {
+// queueDrainAckAsyncStopForGeneration. Synchronous callers pass the globals directly.
+func confirmDrainAckRuntimeDeadForGeneration(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, sessionID, name, expectedToken, expectedGeneration string, processNames []string, stderr io.Writer, timeout, poll time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
 		running, alive, livenessErr := observeRuntimeProviderLiveness(sp, name, processNames)
@@ -553,23 +582,19 @@ func confirmDrainAckRuntimeDead(cityPath string, store beads.Store, sp runtime.P
 			fmt.Fprintf(stderr, "session reconciler: async drain-ack stop %s: runtime still alive after confirm-dead deadline; slot may stay occupied\n", name) //nolint:errcheck
 			return false
 		}
-		// Token fence before every re-kill (mirrors the first-kill fence above
-		// and verifiedStop): the re-kill targets the session by NAME, and a
-		// survivor that finally exits can be replaced by a freshly re-woken
-		// same-name session carrying a different GC_INSTANCE_TOKEN before this
-		// loop next observes it. A definite live-token mismatch means our
-		// intended target is already gone and the name now belongs to a live
-		// replacement — treat the original as confirmed dead and stop rather than
-		// killing the replacement. An empty expected or live token means "cannot
-		// verify" and falls through to the re-kill, matching verifiedStop.
-		if expectedToken != "" {
-			if actualToken, _ := sp.GetMeta(name, "GC_INSTANCE_TOKEN"); actualToken != "" && actualToken != expectedToken {
-				fmt.Fprintf(stderr, "session reconciler: async drain-ack stop %s confirm-dead skipped re-kill: instance token mismatch (session was replaced)\n", name) //nolint:errcheck
-				return true
+		// Recheck the queued row and provider runtime identity before each
+		// conditional stop. The process-local row lock cannot coordinate with a
+		// separate CLI/controller process; the provider operation is the
+		// cross-process compare-and-stop boundary.
+		stopped, err := stopDrainAckRuntimeIfCurrent(cityPath, store, sp, cfg, sessionID, name, expectedToken, expectedGeneration)
+		if err != nil {
+			if !runtime.IsSessionGone(err) {
+				fmt.Fprintf(stderr, "session reconciler: async drain-ack stop %s re-kill: %v\n", name, err) //nolint:errcheck
 			}
+			return false
 		}
-		if err := workerKillSessionTargetWithConfig(cityPath, store, sp, cfg, name); err != nil && !runtime.IsSessionGone(err) {
-			fmt.Fprintf(stderr, "session reconciler: async drain-ack stop %s re-kill: %v\n", name, err) //nolint:errcheck
+		if !stopped {
+			return true
 		}
 		time.Sleep(poll)
 	}
@@ -923,11 +948,11 @@ func reconcileDrainAckStopPending(
 	name := strings.TrimSpace(info.SessionNameMetadata)
 	obs, err := workerObserveSessionTargetWithRuntimeHintsWithConfig(cityPath, store, sp, cfg, info.ID, tp.Hints.ProcessNames)
 	if err != nil || obs.Running || obs.Alive {
-		// Async-stop: queueDrainAckAsyncStop takes the session ID and mutates only
+		// Async-stop: queueDrainAckAsyncStopForGeneration takes the session ID and mutates only
 		// the async tracker, so the snapshot stays coherent — a zero result (applyTo
 		// no-op) matches the unmutated session. The token fence reads the typed
 		// instance_token off the Info snapshot (mirrors verifiedStop).
-		queueDrainAckAsyncStop(cityPath, store, sp, cfg, info.ID, name, info.InstanceToken, tp.Hints.ProcessNames, asyncStopTracker, stderr)
+		queueDrainAckAsyncStopForGeneration(cityPath, store, sp, cfg, info.ID, name, info.InstanceToken, info.Generation, tp.Hints.ProcessNames, asyncStopTracker, stderr)
 		return true, drainAckFinalizeResult{}
 	}
 	return true, finalizeDrainAckStoppedSession(
@@ -996,7 +1021,7 @@ func finalizeDrainAckStopPendingSessions(
 			// Observation unavailable, not "still alive". Re-queue the stop and
 			// say nothing to the agent: a reminder is a claim about the row's
 			// state, and this tick has none.
-			queueDrainAckAsyncStop(cityPath, store, sp, cfg, info.ID, name, info.InstanceToken, processNames, asyncStopTracker, stderr)
+			queueDrainAckAsyncStopForGeneration(cityPath, store, sp, cfg, info.ID, name, info.InstanceToken, info.Generation, processNames, asyncStopTracker, stderr)
 			continue
 		}
 		if obs.Running || obs.Alive {
@@ -1015,7 +1040,7 @@ func finalizeDrainAckStopPendingSessions(
 			// that. Every gate fails closed, so a false return leaves the historical
 			// behavior untouched. See drain_ack_escalation.go.
 			if !escalateWedgedDrainAckStopPending(cityPath, cfg, sp, store, rigStores, info, name, processNames, asyncStopTracker, clk, rec, stderr) {
-				queueDrainAckAsyncStop(cityPath, store, sp, cfg, info.ID, name, info.InstanceToken, processNames, asyncStopTracker, stderr)
+				queueDrainAckAsyncStopForGeneration(cityPath, store, sp, cfg, info.ID, name, info.InstanceToken, info.Generation, processNames, asyncStopTracker, stderr)
 			}
 			continue
 		}
@@ -2388,7 +2413,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								// Token fence off the typed snapshot: the stop-pending fold
 								// preserves instance_token, so infoByID[id].InstanceToken is the
 								// token we intend to stop (mirrors verifiedStop).
-								queueDrainAckAsyncStop(cityPath, store, sp, cfg, id, name, infoByID[id].InstanceToken, tp.Hints.ProcessNames, asyncStopTracker, stderr)
+								info := infoByID[id]
+								queueDrainAckAsyncStopForGeneration(cityPath, store, sp, cfg, id, name, info.InstanceToken, info.Generation, tp.Hints.ProcessNames, asyncStopTracker, stderr)
 								if trace != nil {
 									trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonOrphaned, TraceOutcomeStopPending, template, name, nil)
 								}
@@ -2922,7 +2948,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							clearDrainTrackerForStopPending(id, dt)
 							// Token fence off the typed snapshot (mirrors verifiedStop); the
 							// stop-pending fold preserves instance_token.
-							queueDrainAckAsyncStop(cityPath, store, sp, cfg, id, name, infoByID[id].InstanceToken, tp.Hints.ProcessNames, asyncStopTracker, stderr)
+							info := infoByID[id]
+							queueDrainAckAsyncStopForGeneration(cityPath, store, sp, cfg, id, name, info.InstanceToken, info.Generation, tp.Hints.ProcessNames, asyncStopTracker, stderr)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonAcknowledged, TraceOutcomeStopPending, tp.TemplateName, name, nil)
 							}

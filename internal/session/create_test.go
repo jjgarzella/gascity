@@ -85,6 +85,27 @@ func TestCreateSessionInfoReturnsProjectionOfCreatedBead(t *testing.T) {
 	}
 }
 
+func TestCreateSessionInfoRecordsLegacyAdoptionIdentityDisposition(t *testing.T) {
+	store := beads.NewMemStore()
+	is := NewStore(beads.SessionStore{Store: store})
+	info, err := is.CreateSessionInfo(CreateSpec{
+		Title:                      "worker",
+		AgentName:                  "worker",
+		Metadata:                   map[string]string{"session_name": "city-worker"},
+		RuntimeIdentityDisposition: RuntimeIdentityUnboundLegacy,
+	})
+	if err != nil {
+		t.Fatalf("CreateSessionInfo: %v", err)
+	}
+	created, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get(%q): %v", info.ID, err)
+	}
+	if got := created.Metadata[MetadataRuntimeIdentityDisposition]; got != string(RuntimeIdentityUnboundLegacy) {
+		t.Fatalf("runtime identity disposition = %q, want %q", got, RuntimeIdentityUnboundLegacy)
+	}
+}
+
 // TestCreateSessionInfoErrorContract pins the "no silent half-create" contract:
 // when the store's Create fails, CreateSessionInfo returns a zero Info and the
 // wrapped error, and no session bead is persisted.

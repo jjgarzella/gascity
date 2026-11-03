@@ -408,6 +408,13 @@ var (
 	// session's runtime down (see KillPendingReason). The caller should retry
 	// once the kill completes and the lifecycle rules have taken over again.
 	ErrSessionKillPending = errors.New("session is being killed")
+	// ErrSessionDrainPending reports that the controller is retiring the
+	// session runtime. Attach must not revive or report success for that
+	// runtime generation.
+	ErrSessionDrainPending = errors.New("session is being drained")
+	// ErrSessionAttachSuperseded reports that lifecycle or runtime identity
+	// changed while an attach was in progress.
+	ErrSessionAttachSuperseded = errors.New("session attach was superseded")
 )
 
 type sessionMutationLockEntry struct {

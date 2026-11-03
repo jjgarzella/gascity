@@ -419,7 +419,7 @@ func escalateWedgedDrainAckStopPending(
 	// keeps the marker exactly as durable as it was (nothing is forced before it
 	// lands) while binding it to an attempt that will actually run.
 	//
-	// The "escalate:" prefix is a distinct key space from queueDrainAckAsyncStop
+	// The "escalate:" prefix is a distinct key space from queueDrainAckAsyncStopForGeneration
 	// so an in-flight ordinary stop does not dedup the escalation away (and vice
 	// versa).
 	done, queued := tracker.startDrainAckStop("escalate:" + drainAckAsyncStopKey(info.ID, name))
@@ -477,7 +477,7 @@ func queueDrainAckForcedTermination(
 	sessionID := strings.TrimSpace(info.ID)
 	expectedToken := info.InstanceToken
 	// Bind the mutable package-global seams on the CALLER's goroutine, at queue
-	// time, for the reason documented on queueDrainAckAsyncStop: this goroutine
+	// time, for the reason documented on queueDrainAckAsyncStopForGeneration: this goroutine
 	// outlives its reconcile invocation, so re-reading them from inside it races
 	// a test swapping them and lets one test's goroutine poke another test's
 	// counter. drainAckDetectSubreaperPID is bound the same way, by the caller.
@@ -488,7 +488,7 @@ func queueDrainAckForcedTermination(
 		// controller process, and this body is strictly larger and more fragile
 		// than the ordinary stop's: a provider stop, a bounded confirm-dead loop,
 		// a supervisor-wide /proc walk, and raw PID signaling. Mirrors
-		// queueDrainAckAsyncStop, including the ordering — done() stays in the
+		// queueDrainAckAsyncStopForGeneration, including the ordering — done() stays in the
 		// same deferred closure, AFTER the recover, so the termination slot is
 		// released on the panic path too.
 		defer func() {
@@ -497,12 +497,24 @@ func queueDrainAckForcedTermination(
 			}
 			done()
 		}()
-		// Try the ordinary provider stop once more first: it is the cheap path and
-		// it is what a merely-slow pane needs.
-		if err := workerKillSessionTargetWithConfig(cityPath, store, sp, cfg, name); err != nil && !runtime.IsSessionGone(err) {
-			fmt.Fprintf(stderr, "%s: stopping %s: %v\n", drainAckEscalationLabel, name, err) //nolint:errcheck
+		generation := sessionRuntimeGeneration(info.Generation)
+		stopped, err := stopDrainAckRuntimeIfCurrent(cityPath, store, sp, cfg, sessionID, name, expectedToken, generation)
+		if err != nil {
+			if !runtime.IsSessionGone(err) {
+				fmt.Fprintf(stderr, "%s: stopping %s: %v\n", drainAckEscalationLabel, name, err) //nolint:errcheck
+			}
+			recordDrainAckEscalation(cfg, info, name, reason, "conditional_stop_failed", attempt, rec)
+			_ = poke(cityPath)
+			return
 		}
-		if confirmDrainAckRuntimeDead(cityPath, store, sp, cfg, name, expectedToken, processNames, stderr, confirmTimeout, confirmPoll) {
+		if !stopped {
+			// A different row or runtime incarnation now owns the name. Its
+			// process must not be swept up by the force path below.
+			recordDrainAckEscalation(cfg, info, name, reason, "identity_changed", attempt, rec)
+			_ = poke(cityPath)
+			return
+		}
+		if confirmDrainAckRuntimeDeadForGeneration(cityPath, store, sp, cfg, sessionID, name, expectedToken, generation, processNames, stderr, confirmTimeout, confirmPoll) {
 			recordDrainAckEscalation(cfg, info, name, reason, "stopped_without_force", attempt, rec)
 			// The caller suppresses its ordinary stop on a true return, so this
 			// goroutine also owns that stop's poke: the runtime is gone but the
@@ -511,13 +523,13 @@ func queueDrainAckForcedTermination(
 			// full patrol interval — reintroducing exactly the latency ga-ryhnhd
 			// removed, on the rows this pass exists to rescue. Best-effort and
 			// deliberately unlogged, for the stderr-race reason documented on
-			// queueDrainAckAsyncStop's poke.
+			// queueDrainAckAsyncStopForGeneration's poke.
 			_ = poke(cityPath)
 			return
 		}
 		// The pane outlived the ordinary stop. This is the population the whole
 		// pass exists for, so apply the force the ordinary path does not have.
-		outcome := terminateDrainAckRuntimeByProcessTable(cityPath, sp, sessionID, name, expectedToken, subreaperPID, now, stderr)
+		outcome := terminateDrainAckRuntimeByProcessTable(cityPath, sp, sessionID, name, expectedToken, generation, subreaperPID, now, stderr)
 		recordDrainAckEscalation(cfg, info, name, reason, outcome, attempt, rec)
 		_ = poke(cityPath)
 	}()
@@ -532,32 +544,32 @@ func queueDrainAckForcedTermination(
 //
 // The existing ProcessTableScanner callers refuse to touch IsTracked runtimes,
 // which is every live session; this route replaces that guard with the caller's
-// gates plus two fences applied here: the runtime must still carry the instance
-// token we parked, and the process must be positively attributed to THIS city.
+// gates plus identity and attribution fences: the process must carry this
+// session ID and runtime epoch, and must be positively attributed to THIS city.
 // The /proc scan is supervisor-wide, so without the city fence this would
 // SIGKILL a sibling city's healthy session.
 func terminateDrainAckRuntimeByProcessTable(
 	cityPath string,
 	sp runtime.Provider,
-	sessionID, name, expectedToken string,
+	sessionID, name, expectedToken, expectedGeneration string,
 	subreaperPID int,
 	now time.Time,
 	stderr io.Writer,
 ) string {
+	identity := runtime.Identity{
+		SessionID:     strings.TrimSpace(sessionID),
+		RuntimeEpoch:  sessionRuntimeGeneration(expectedGeneration),
+		InstanceToken: strings.TrimSpace(expectedToken),
+	}
+	if !identity.IsComplete() {
+		fmt.Fprintf(stderr, "%s: %s force-terminate skipped: runtime identity is incomplete\n", drainAckEscalationLabel, name) //nolint:errcheck
+		return "identity_incomplete"
+	}
 	scanner, ok := sp.(runtime.ProcessTableScanner)
 	if !ok {
 		fmt.Fprintf(stderr, "%s: %s survived its stop and the provider cannot scan the process table; slot stays occupied\n", //nolint:errcheck
 			drainAckEscalationLabel, name)
 		return "no_process_table"
-	}
-	// Re-check the fence immediately before the destructive act: the ordinary
-	// stop and its confirm loop have just spent seconds, and a replacement may
-	// have taken the name in the meantime.
-	if expected := strings.TrimSpace(expectedToken); expected != "" {
-		if actual, _ := sp.GetMeta(name, "GC_INSTANCE_TOKEN"); actual != "" && strings.TrimSpace(actual) != expected {
-			fmt.Fprintf(stderr, "%s: %s force-terminate skipped: instance token mismatch (session was replaced)\n", drainAckEscalationLabel, name) //nolint:errcheck
-			return "token_mismatch"
-		}
 	}
 	// Re-check the quiet hold too, for the same reason and against the same
 	// window: the hold was last evaluated on the reconcile tick, an ordinary
@@ -577,7 +589,12 @@ func terminateDrainAckRuntimeByProcessTable(
 		fmt.Fprintf(stderr, "%s: scanning process table for %s: %v\n", drainAckEscalationLabel, name, err) //nolint:errcheck
 	}
 	targets, skipped := drainAckForceTerminationTargets(found, sessionID, cityPath, name, subreaperPID, stderr)
+	targets, identitySkipped := drainAckForceTerminationTargetsForIdentity(targets, identity, name, stderr)
+	skipped += identitySkipped
 	if len(targets) == 0 {
+		if identitySkipped > 0 {
+			return "runtime_identity_mismatch"
+		}
 		fmt.Fprintf(stderr, //nolint:errcheck
 			"%s: %s survived its stop but no process was attributable to this seat (%d scan hit(s) refused); slot stays occupied\n",
 			drainAckEscalationLabel, name, skipped)
@@ -596,6 +613,31 @@ func terminateDrainAckRuntimeByProcessTable(
 		return "termination_failed"
 	}
 	return "force_terminated"
+}
+
+// drainAckForceTerminationTargetsForIdentity drops scanner hits whose process
+// environment belongs to another runtime epoch. The provider stop and every
+// confirm-dead re-kill are already conditional; this final process-table path
+// must preserve that same identity when it reaches an escaped process outside
+// provider topology.
+func drainAckForceTerminationTargetsForIdentity(found []runtime.LiveRuntime, identity runtime.Identity, name string, stderr io.Writer) ([]runtime.LiveRuntime, int) {
+	expectedEpoch, err := strconv.Atoi(strings.TrimSpace(identity.RuntimeEpoch))
+	if err != nil || expectedEpoch <= 0 {
+		return nil, len(found)
+	}
+	targets := make([]runtime.LiveRuntime, 0, len(found))
+	skipped := 0
+	for _, live := range found {
+		if strings.TrimSpace(live.SessionID) != identity.SessionID || live.Epoch != expectedEpoch {
+			skipped++
+			// Diagnostic failure cannot change the already-filtered PID set.
+			_, _ = fmt.Fprintf(stderr, "%s: %s skipping pid=%d: runtime identity session=%q epoch=%d does not match queued session=%q epoch=%d\n",
+				drainAckEscalationLabel, name, live.PID, live.SessionID, live.Epoch, identity.SessionID, expectedEpoch)
+			continue
+		}
+		targets = append(targets, live)
+	}
+	return targets, skipped
 }
 
 // drainAckForceTerminationTargets selects, from the scan hits for a session, the

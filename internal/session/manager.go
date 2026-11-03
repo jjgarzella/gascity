@@ -1217,17 +1217,78 @@ func (m *Manager) createBeadOnly(spec CreateOptions) (Info, error) {
 // suspended, it is resumed first using resumeCommand. If the tmux session
 // died (active bead but no process), it is restarted.
 func (m *Manager) Attach(ctx context.Context, id string, resumeCommand string, hints runtime.Config) error {
-	return withSessionMutationLock(id, func() error {
-		b, sessName, err := m.sessionBead(id)
+	var sessName string
+	var generation, instanceToken, continuationEpoch string
+	if err := withSessionMutationLock(id, func() error {
+		var b beads.Bead
+		var err error
+		b, sessName, err = m.sessionBead(id)
 		if err != nil {
+			return err
+		}
+		if err := m.attachStartAllowed(id, b); err != nil {
 			return err
 		}
 		if err := m.ensureRunning(ctx, id, b, sessName, resumeCommand, hints); err != nil {
 			return err
 		}
+		// ensureRunning may have resumed a dormant session and committed its
+		// current incarnation identity. Capture that identity before the
+		// terminal boundary so the post-attach check can reject a replacement.
+		b, sessName, err = m.sessionBead(id)
+		if err != nil {
+			return err
+		}
+		if err := m.attachStartAllowed(id, b); err != nil {
+			return err
+		}
+		generation = b.Metadata["generation"]
+		instanceToken = b.Metadata["instance_token"]
+		continuationEpoch = b.Metadata["continuation_epoch"]
+		return nil
+	}); err != nil {
+		return err
+	}
 
-		return m.sp.Attach(sessName)
+	// Provider Attach can be an interactive terminal that stays open for an
+	// arbitrary time. Do not hold the session mutation lock across it: the
+	// controller must be able to record a drain and stop the runtime while the
+	// user is attached. The postflight below makes that overlap observable as a
+	// failed attach instead of reporting success for a retired generation.
+	if err := m.sp.Attach(sessName); err != nil {
+		return err
+	}
+
+	return withSessionMutationLock(id, func() error {
+		b, _, err := m.sessionBead(id)
+		if err != nil {
+			return fmt.Errorf("checking session after attach: %w", err)
+		}
+		if err := m.attachStartAllowed(id, b); err != nil {
+			return err
+		}
+		view := ProjectLifecycle(LifecycleInputFromMetadata(b.Status, b.Metadata))
+		if view.BaseState != BaseStateActive ||
+			b.Metadata["generation"] != generation ||
+			b.Metadata["instance_token"] != instanceToken ||
+			b.Metadata["continuation_epoch"] != continuationEpoch {
+			return fmt.Errorf("%w: %s", ErrSessionAttachSuperseded, id)
+		}
+		return nil
 	})
+}
+
+func (m *Manager) attachStartAllowed(id string, b beads.Bead) error {
+	if KillPendingMetadata(
+		b.Metadata["state"], b.Metadata["state_reason"], b.Metadata["sleep_reason"], b.Metadata["slept_at"], m.now(),
+	) {
+		return fmt.Errorf("%w: %s", ErrSessionKillPending, id)
+	}
+	view := ProjectLifecycle(LifecycleInputFromMetadata(b.Status, b.Metadata))
+	if view.BaseState == BaseStateDraining {
+		return fmt.Errorf("%w: %s", ErrSessionDrainPending, id)
+	}
+	return nil
 }
 
 // suspendIntent distinguishes an operator's explicit, targeted suspend from the
@@ -1530,6 +1591,35 @@ func (m *Manager) Kill(id string) error {
 		}
 	}
 	return m.sp.Stop(sessName)
+}
+
+// KillRuntimeIfCurrent stops only the provider runtime incarnation that still
+// matches the session bead's ID, generation, and instance token. Providers that
+// cannot compare and stop within their own lifecycle serialization boundary
+// return ErrConditionalStopUnsupported and leave the runtime untouched.
+func (m *Manager) KillRuntimeIfCurrent(id string, identity runtime.Identity) (bool, error) {
+	if !identity.IsComplete() {
+		return false, runtime.ErrRuntimeIdentityRequired
+	}
+	b, sessName, err := m.sessionBead(id)
+	if err != nil {
+		return false, err
+	}
+	if b.ID != identity.SessionID {
+		return false, nil
+	}
+	if disposition := strings.TrimSpace(b.Metadata[MetadataRuntimeIdentityDisposition]); disposition != "" {
+		return false, fmt.Errorf("%w: session %q runtime identity disposition %q does not permit conditional stop until provider-owned runtime identity is bound or it is safely retired", runtime.ErrConditionalStopUnsupported, id, disposition)
+	}
+	if CanonicalRuntimeGeneration(b.Metadata["generation"]) != strings.TrimSpace(identity.RuntimeEpoch) ||
+		strings.TrimSpace(b.Metadata["instance_token"]) != strings.TrimSpace(identity.InstanceToken) {
+		return false, nil
+	}
+	stopper, ok := m.sp.(runtime.ConditionalStopProvider)
+	if !ok {
+		return false, fmt.Errorf("%w: provider %T", runtime.ErrConditionalStopUnsupported, m.sp)
+	}
+	return stopper.StopIfCurrent(sessName, identity)
 }
 
 // BeginDrain transitions a session to the draining state. The caller is

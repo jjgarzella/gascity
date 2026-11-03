@@ -304,7 +304,60 @@ func newWorkerSessionHandleForResolvedRuntimeWithConfig(
 	// runtime.Config directly and never routes through resolveTemplate
 	// (gc-6bw8o).
 	applyWorkerOverlayHints(&sessionCfg.Runtime.Hints, cfg, cityPath, template, resolved)
+	// This is a fresh provider conversation even when the provider accepts a
+	// caller-generated session key. Render and route its initial prompt through
+	// the same policy as controller starts; later keyed resumes use the separate
+	// resume resolver and do not replay this startup text.
+	promptHints, err := workerDirectCreatePromptHints(cityPath, cfg, template, firstNonEmptyGCString(metadata["agent_name"], template), transport)
+	if err != nil {
+		return nil, fmt.Errorf("resolving direct-start prompt: %w", err)
+	}
+	applyWorkerStartupPromptHints(&sessionCfg.Runtime.Hints, promptHints)
 	return factory.SessionForResolvedRuntime(sessionCfg)
+}
+
+// workerDirectCreatePromptHints renders the configured initial prompt for a
+// direct `session new` start. It uses resolveTemplate so prompt rendering and
+// argv/flag/nudge selection match controller-managed fresh starts.
+func workerDirectCreatePromptHints(cityPath string, cfg *config.City, template, qualifiedName, transport string) (runtime.Config, error) {
+	if cfg == nil {
+		return runtime.Config{}, nil
+	}
+	if strings.TrimSpace(transport) == config.SessionTransportACP {
+		return runtime.Config{}, nil
+	}
+	agentCfg := findAgentByTemplate(cfg, template)
+	if agentCfg == nil || strings.TrimSpace(agentCfg.PromptTemplate) == "" {
+		return runtime.Config{}, nil
+	}
+	params := newAgentBuildParams(cfg.EffectiveCityName(), cityPath, cfg, nil, time.Now().UTC(), nil, nil)
+	templateParams, err := resolveTemplate(params, agentCfg, firstNonEmptyGCString(qualifiedName, template), nil)
+	if err != nil {
+		return runtime.Config{}, err
+	}
+	promptConfig, _, err := templateParamsToConfigWithDelivery(templateParams)
+	if err != nil {
+		return runtime.Config{}, err
+	}
+	return promptConfig, nil
+}
+
+func applyWorkerStartupPromptHints(runtimeHints *runtime.Config, promptHints runtime.Config) {
+	if runtimeHints == nil {
+		return
+	}
+	runtimeHints.PromptSuffix = promptHints.PromptSuffix
+	runtimeHints.PromptFlag = promptHints.PromptFlag
+	runtimeHints.Nudge = promptHints.Nudge
+	if promptHints.Env[startupPromptDeliveredEnv] == "" {
+		return
+	}
+	env := make(map[string]string, len(runtimeHints.Env)+1)
+	for key, value := range runtimeHints.Env {
+		env[key] = value
+	}
+	env[startupPromptDeliveredEnv] = promptHints.Env[startupPromptDeliveredEnv]
+	runtimeHints.Env = env
 }
 
 func resolvedWorkerSessionConfigWithConfig(
@@ -501,6 +554,18 @@ func workerKillSessionTargetWithConfig(cityPath string, store beads.Store, sp ru
 	return handle.Kill(context.Background())
 }
 
+func workerKillSessionIfCurrentWithConfig(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, sessionID string, identity runtime.Identity) (bool, error) {
+	handle, err := workerHandleForSessionWithConfig(cityPath, store, sp, cfg, sessionID)
+	if err != nil {
+		return false, err
+	}
+	conditional, ok := handle.(worker.ConditionalKillHandle)
+	if !ok {
+		return false, fmt.Errorf("%w: worker handle %T", runtime.ErrConditionalStopUnsupported, handle)
+	}
+	return conditional.KillIfCurrent(context.Background(), identity)
+}
+
 // workerStopSessionTargetForShutdownWithConfig is the city stop/restart sweep's
 // stop. It is separate from workerStopSessionTargetWithConfig so the draining
 // latitude reaches only the sweep and never a targeted operator command.
@@ -678,6 +743,13 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	// path does; this resume resolver builds runtime.Config directly and never
 	// routes through resolveTemplate (gc-6bw8o).
 	applyWorkerOverlayHints(&runtimeHints, cfg, cityPath, info.Template, resolved)
+	if strings.TrimSpace(info.SessionKey) == "" && transport != config.SessionTransportACP {
+		promptHints, err := workerFreshStartPromptHints(cityPath, cfg, info)
+		if err != nil {
+			return nil, fmt.Errorf("resolving fresh-start prompt: %w", err)
+		}
+		applyWorkerStartupPromptHints(&runtimeHints, promptHints)
+	}
 	return &worker.ResolvedRuntime{
 		Command:    command,
 		WorkDir:    workDir,
@@ -691,6 +763,31 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 			SessionIDFlag: resolved.SessionIDFlag,
 		},
 	}, nil
+}
+
+// workerFreshStartPromptHints renders and routes the configured startup prompt
+// for a resume request that has no provider session key and therefore starts a
+// new conversation. A keyed resume leaves startup delivery to the provider's
+// resume/session-start behavior so it does not inject the initial prompt twice.
+func workerFreshStartPromptHints(cityPath string, cfg *config.City, info session.Info) (runtime.Config, error) {
+	if cfg == nil {
+		return runtime.Config{}, nil
+	}
+	agentCfg := findAgentByTemplate(cfg, info.Template)
+	if agentCfg == nil || strings.TrimSpace(agentCfg.PromptTemplate) == "" {
+		return runtime.Config{}, nil
+	}
+	qualifiedName := firstNonEmptyGCString(info.AgentName, info.Template)
+	params := newAgentBuildParams(cfg.EffectiveCityName(), cityPath, cfg, nil, time.Now().UTC(), nil, nil)
+	tp, err := resolveTemplateForSessionBeadInfo(params, agentCfg, qualifiedName, nil, info)
+	if err != nil {
+		return runtime.Config{}, err
+	}
+	promptConfig, _, err := templateParamsToConfigWithDelivery(tp)
+	if err != nil {
+		return runtime.Config{}, err
+	}
+	return promptConfig, nil
 }
 
 func resolvedWorkerRuntimeProviderLabel(resolved *config.ResolvedProvider, transport string, info session.Info) string {

@@ -20,6 +20,7 @@ type Provider struct {
 
 var (
 	_ runtime.Provider                      = (*Provider)(nil)
+	_ runtime.ConditionalStopProvider       = (*Provider)(nil)
 	_ runtime.DeadRuntimeSessionChecker     = (*Provider)(nil)
 	_ runtime.InteractionProvider           = (*Provider)(nil)
 	_ runtime.IdleSnapshotProvider          = (*Provider)(nil)
@@ -53,6 +54,16 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 // Stop delegates to the routed backend.
 func (p *Provider) Stop(name string) error {
 	return p.route(name).Stop(name)
+}
+
+// StopIfCurrent delegates the identity-fenced stop to the selected backend.
+func (p *Provider) StopIfCurrent(name string, identity runtime.Identity) (bool, error) {
+	backend := p.route(name)
+	stopper, ok := backend.(runtime.ConditionalStopProvider)
+	if !ok {
+		return false, fmt.Errorf("%w: provider %T", runtime.ErrConditionalStopUnsupported, backend)
+	}
+	return stopper.StopIfCurrent(name, identity)
 }
 
 // Interrupt delegates to the routed backend.

@@ -17,7 +17,33 @@ const (
 
 	// DefaultContinuationEpoch is the first conversation identity epoch.
 	DefaultContinuationEpoch = 1
+
+	// MetadataRuntimeIdentityDisposition records when a session's durable
+	// identity is not bound to the provider-owned runtime incarnation.
+	MetadataRuntimeIdentityDisposition = "runtime_identity_disposition"
 )
+
+// RuntimeIdentityDisposition describes whether a session bead has a safe
+// provider-owned runtime identity for conditional lifecycle operations.
+type RuntimeIdentityDisposition string
+
+const (
+	// RuntimeIdentityUnboundLegacy marks a runtime adopted from an older
+	// supervisor when the provider cannot atomically bind its immutable runtime
+	// handle to the new session bead identity.
+	RuntimeIdentityUnboundLegacy RuntimeIdentityDisposition = "unbound-legacy"
+)
+
+// CanonicalRuntimeGeneration applies the shared legacy generation rule used
+// by controller lifecycle operations: missing, invalid, and nonpositive
+// values denote the default generation.
+func CanonicalRuntimeGeneration(raw string) string {
+	generation, err := strconv.Atoi(raw)
+	if err != nil || generation <= 0 {
+		generation = DefaultGeneration
+	}
+	return strconv.Itoa(generation)
+}
 
 // NewInstanceToken returns a cryptographically random token for fencing
 // drain/stop and async delivery against stale session incarnations.

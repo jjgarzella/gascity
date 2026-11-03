@@ -71,15 +71,17 @@ type Fake struct {
 }
 
 var (
-	_ ProcessTableScanner = (*Fake)(nil)
-	_ RelaunchProvider    = (*Fake)(nil)
-	_ InputClearProvider  = (*Fake)(nil)
+	_ ProcessTableScanner     = (*Fake)(nil)
+	_ RelaunchProvider        = (*Fake)(nil)
+	_ InputClearProvider      = (*Fake)(nil)
+	_ ConditionalStopProvider = (*Fake)(nil)
 )
 
 // Call records a single method invocation on [Fake].
 type Call struct {
 	Method    string         // method name (e.g. "Start", "Stop", "SetMeta")
 	Name      string         // session name argument
+	Identity  Identity       // only set for StopIfCurrent calls
 	Config    Config         // only set for Start calls
 	Message   string         // only set for Nudge/SendKeys calls (flattened text)
 	Content   []ContentBlock // only set for Nudge calls (structured content)
@@ -218,6 +220,35 @@ func (f *Fake) Stop(name string) error {
 	}
 	delete(f.sessions, name)
 	return nil
+}
+
+// StopIfCurrent atomically compares the runtime identity and stops the match.
+func (f *Fake) StopIfCurrent(name string, identity Identity) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, Call{Method: "StopIfCurrent", Name: name, Identity: identity})
+	if !identity.IsComplete() {
+		return false, ErrRuntimeIdentityRequired
+	}
+	if f.broken {
+		return false, fmt.Errorf("session unavailable")
+	}
+	if _, ok := f.sessions[name]; !ok {
+		return false, nil
+	}
+	meta := f.meta[name]
+	if meta["GC_SESSION_ID"] != identity.SessionID ||
+		meta["GC_RUNTIME_EPOCH"] != identity.RuntimeEpoch ||
+		meta["GC_INSTANCE_TOKEN"] != identity.InstanceToken {
+		return false, nil
+	}
+	if err, ok := f.StopErrors[name]; ok {
+		return false, err
+	}
+	if !f.StopLeavesRunning[name] {
+		delete(f.sessions, name)
+	}
+	return true, nil
 }
 
 // Relaunch records a warm-box agent relaunch and, on success, updates the live
@@ -646,6 +677,7 @@ func (f *Fake) FindRuntimesBySessionID(id string) ([]LiveRuntime, error) {
 		if city == "" {
 			city = cfg.Env["GC_CITY"]
 		}
+		epoch, _ := strconv.Atoi(cfg.Env["GC_RUNTIME_EPOCH"])
 		// A live provider-owned pane: its root process still has the provider's
 		// server as its parent, so PPID is a real pid rather than init and the
 		// scan can positively attribute the parent to the provider. That
@@ -655,6 +687,7 @@ func (f *Fake) FindRuntimesBySessionID(id string) ([]LiveRuntime, error) {
 		out = append(out, LiveRuntime{
 			SessionID:                      sessionID,
 			City:                           city,
+			Epoch:                          epoch,
 			ProviderName:                   name,
 			IsTracked:                      true,
 			PID:                            fakePaneRootPID,

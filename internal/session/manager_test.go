@@ -21,6 +21,23 @@ import (
 
 func immediateStaleKeyDetectionWaiter(context.Context, string) error { return nil }
 
+type attachBarrierProvider struct {
+	*runtime.Fake
+	entered chan struct{}
+	release chan struct{}
+}
+
+type providerWithoutConditionalStop struct{ runtime.Provider }
+
+func (p *attachBarrierProvider) Attach(name string) error {
+	if err := p.Fake.Attach(name); err != nil {
+		return err
+	}
+	close(p.entered)
+	<-p.release
+	return nil
+}
+
 type manualStaleKeyDetectionWaiter struct {
 	entered     chan string
 	release     chan struct{}
@@ -2219,6 +2236,86 @@ func TestAttachActiveReattach(t *testing.T) {
 	}
 	if got.State != StateActive {
 		t.Errorf("State = %q, want %q", got.State, StateActive)
+	}
+}
+
+func TestAttachFailsWhenDrainStartsDuringProviderAttach(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &attachBarrierProvider{
+		Fake:    runtime.NewFake(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{
+		Template: "worker", Command: "codex", WorkDir: t.TempDir(), Provider: "codex",
+		Resume: ProviderResume{}, Hints: runtime.Config{},
+		ExtraMeta: map[string]string{"session_origin": "manual"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	attachDone := make(chan error, 1)
+	go func() {
+		attachDone <- mgr.Attach(context.Background(), info.ID, "codex", runtime.Config{})
+	}()
+	select {
+	case <-sp.entered:
+	case err := <-attachDone:
+		t.Fatalf("Attach returned before provider boundary: %v", err)
+	case <-time.After(goroutineHangBudget):
+		t.Fatal("Attach did not reach provider boundary")
+	}
+
+	if err := store.SetMetadataBatch(info.ID, map[string]string(DrainAckStopPendingPatch(time.Now().UTC()))); err != nil {
+		t.Fatalf("mark drain stop pending: %v", err)
+	}
+	if err := sp.Stop(info.SessionName); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	close(sp.release)
+
+	select {
+	case err := <-attachDone:
+		if err == nil {
+			t.Fatal("Attach succeeded after the controller retired its runtime generation")
+		}
+	case <-time.After(goroutineHangBudget):
+		t.Fatal("Attach did not return after provider boundary was released")
+	}
+}
+
+func TestAttachRefusesExistingDrainPendingState(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &attachBarrierProvider{
+		Fake:    runtime.NewFake(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	mgr := NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{
+		Template: "worker", Command: "codex", WorkDir: t.TempDir(), Provider: "codex",
+		Resume: ProviderResume{}, Hints: runtime.Config{},
+		BeadOnly:  true,
+		ExtraMeta: map[string]string{"session_origin": "manual"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.SetMetadataBatch(info.ID, map[string]string(DrainAckStopPendingPatch(time.Now().UTC()))); err != nil {
+		t.Fatalf("mark drain stop pending: %v", err)
+	}
+	err = mgr.Attach(context.Background(), info.ID, "codex", runtime.Config{})
+	if !errors.Is(err, ErrSessionDrainPending) {
+		t.Fatalf("Attach error = %v, want ErrSessionDrainPending", err)
+	}
+	if got := sp.CountCalls("Start", info.SessionName); got != 0 {
+		t.Fatalf("provider Start calls = %d, want 0 for a draining session", got)
+	}
+	if got := sp.CountCalls("Attach", info.SessionName); got != 0 {
+		t.Fatalf("provider Attach calls = %d, want 0 for a draining session", got)
 	}
 }
 
@@ -4840,6 +4937,95 @@ func TestKill_ActiveState(t *testing.T) {
 	}
 	if err := mgr.Kill(info.ID); err != nil {
 		t.Fatalf("Kill active session: %v", err)
+	}
+}
+
+func TestKillRuntimeIfCurrentFailsClosedWithoutProviderCapability(t *testing.T) {
+	store := beads.NewMemStore()
+	fake := runtime.NewFake()
+	sp := providerWithoutConditionalStop{Provider: fake}
+	mgr := NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{
+		ExplicitName: "sky", Template: "helper", Title: "test", Command: "claude", WorkDir: "/tmp", Provider: "claude",
+		Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	identity := runtime.Identity{SessionID: info.ID, RuntimeEpoch: info.Generation, InstanceToken: info.InstanceToken}
+	if stopped, err := mgr.KillRuntimeIfCurrent(info.ID, identity); stopped || !errors.Is(err, runtime.ErrConditionalStopUnsupported) {
+		t.Fatalf("KillRuntimeIfCurrent = %t, %v; want false, ErrConditionalStopUnsupported", stopped, err)
+	}
+	if !fake.IsRunning(info.SessionName) {
+		t.Fatal("provider without conditional stop killed a runtime by name")
+	}
+	if fake.CountCalls("Stop", info.SessionName) != 0 {
+		t.Fatal("provider without conditional stop received an unconditional name stop")
+	}
+}
+
+func TestKillRuntimeIfCurrentCanonicalizesLegacyGeneration(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{
+		ExplicitName: "legacy", Template: "helper", Title: "legacy", Command: "claude", WorkDir: "/tmp", Provider: "claude",
+		Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for key, value := range map[string]string{
+		"GC_SESSION_ID":     info.ID,
+		"GC_RUNTIME_EPOCH":  info.Generation,
+		"GC_INSTANCE_TOKEN": info.InstanceToken,
+	} {
+		if err := sp.SetMeta(info.SessionName, key, value); err != nil {
+			t.Fatalf("seed fake provider identity %s: %v", key, err)
+		}
+	}
+	if err := store.SetMetadata(info.ID, "generation", ""); err != nil {
+		t.Fatalf("clear legacy generation: %v", err)
+	}
+	identity := runtime.Identity{SessionID: info.ID, RuntimeEpoch: "1", InstanceToken: info.InstanceToken}
+	if stopped, err := mgr.KillRuntimeIfCurrent(info.ID, identity); err != nil || !stopped {
+		t.Fatalf("KillRuntimeIfCurrent = %t, %v; want true, nil", stopped, err)
+	}
+	if sp.IsRunning(info.SessionName) {
+		t.Fatal("matching provider runtime remains after canonical generation stop")
+	}
+}
+
+func TestKillRuntimeIfCurrentBlocksUnboundLegacyAdoption(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{
+		ExplicitName: "legacy", Template: "helper", Title: "legacy", Command: "claude", WorkDir: "/tmp", Provider: "claude",
+		Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, MetadataRuntimeIdentityDisposition, string(RuntimeIdentityUnboundLegacy)); err != nil {
+		t.Fatalf("mark legacy runtime identity unbound: %v", err)
+	}
+	identity := runtime.Identity{SessionID: info.ID, RuntimeEpoch: info.Generation, InstanceToken: info.InstanceToken}
+	stopped, err := mgr.KillRuntimeIfCurrent(info.ID, identity)
+	if stopped || !errors.Is(err, runtime.ErrConditionalStopUnsupported) {
+		t.Fatalf("KillRuntimeIfCurrent = %t, %v; want false, ErrConditionalStopUnsupported", stopped, err)
+	}
+	if !strings.Contains(err.Error(), "provider-owned runtime identity") {
+		t.Fatalf("error = %q, want actionable provider-owned identity blocker", err)
+	}
+	if !sp.IsRunning(info.SessionName) {
+		t.Fatal("unbound legacy runtime was stopped")
+	}
+	if sp.CountCalls("StopIfCurrent", info.SessionName) != 0 {
+		t.Fatal("unbound legacy runtime reached provider conditional stop")
+	}
+	if sp.CountCalls("Stop", info.SessionName) != 0 {
+		t.Fatal("unbound legacy runtime received name-only Stop")
 	}
 }
 
