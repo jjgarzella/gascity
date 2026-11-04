@@ -4661,33 +4661,41 @@ esac
 	assertJSONEqual(t, out, `[{"id":"ga-control-ready"}]`)
 }
 
-func TestWorkflowServeControlReadyQueryFailsOnMalformedBDJSON(t *testing.T) {
-	query := workflowServeControlReadyQuery(
-		config.Agent{Name: config.ControlDispatcherAgentName, Dir: "gascity"},
-		"gascity--control-dispatcher",
-	)
+func TestControlReadyFallbackRejectsMalformedBDJSON(t *testing.T) {
 	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "bd.log")
 	bdPath := filepath.Join(tmp, "bd")
-	if err := os.WriteFile(bdPath, []byte(`#!/bin/sh
+	queryArgs := fmt.Sprintf("--readonly --sandbox ready --json --exclude-type=%s --limit=%d", controlReadyExcludeType, controlReadyFallbackLimit)
+	script := fmt.Sprintf(`#!/bin/sh
 set -eu
+printf '%%s\n' "$*" > "$BD_LOG"
 case "$*" in
-  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
+  %q)
     printf 'not-json'
     ;;
   *)
-    printf '[]'
+    printf 'unexpected bd argv: %%s\n' "$*" >&2
+    exit 97
     ;;
 esac
-`), 0o755); err != nil {
+
+`, queryArgs)
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake bd: %v", err)
 	}
-	_, err := shellWorkQueryWithEnv(query, t.TempDir(), []string{
-		"PATH=" + tmp + string(os.PathListSeparator) + os.Getenv("PATH"),
-		"GC_SESSION_NAME=gascity--control-dispatcher",
-		"GC_ALIAS=gascity/control-dispatcher",
-	})
-	if err == nil {
-		t.Fatal("workflow serve query succeeded with malformed bd JSON")
+	_, err := controlReadyScopeShellReady(t.TempDir(), map[string]string{
+		"PATH":   tmp + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"BD_LOG": logPath,
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "control-ready fallback: unexpected bd ready output: not-json") {
+		t.Fatalf("control-ready fallback error = %v, want malformed bd ready output", err)
+	}
+	gotArgs, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd argv receipt: %v", err)
+	}
+	if string(gotArgs) != queryArgs+"\n" {
+		t.Fatalf("bd argv = %q, want %q", gotArgs, queryArgs)
 	}
 }
 

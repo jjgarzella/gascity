@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,7 +11,24 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/testutil"
 )
+
+// runCmdGCTestHelper starts this test binary with a bounded lifetime. Keeping
+// the helper here lets independent process-backed tests share one audited
+// process-launch site while preserving their own environment and assertions.
+func runCmdGCTestHelper(args, env []string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.ExecRaceTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], args...)
+	cmd.Env = env
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return output, fmt.Errorf("test helper exceeded %s: %w", testutil.ExecRaceTimeout, ctx.Err())
+	}
+	return output, err
+}
 
 func TestManagedDoltScopeGone(t *testing.T) {
 	dir := t.TempDir()
@@ -107,18 +125,19 @@ func TestManagedDoltScopeWatchdogKillsServerWhenScopeDeleted(t *testing.T) {
 		t.Fatalf("write config: %v", err)
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestManagedDoltScopeWatchdogHelper", "-test.v")
-	cmd.Env = sanitizedBaseEnv(
-		"GC_TEST_MANAGED_DOLT_HELPER=scope-watchdog",
-		"GC_TEST_MANAGED_DOLT_HELPER_STATE="+statePath,
-		"GC_TEST_MANAGED_DOLT_HELPER_CONFIG="+configPath,
-		"GC_TEST_MANAGED_DOLT_HELPER_LOG="+logPath,
-		"GC_TEST_MANAGED_DOLT_HELPER_FAKE_DOLT_DIR="+fakeDoltDir,
-		// TestMain scrubs non-GC_TEST_ GC_* keys, so the interval rides a
-		// GC_TEST_ control var and the helper re-exports it for the watchdog.
-		"GC_TEST_MANAGED_DOLT_HELPER_SCOPE_WD_INTERVAL_MS=50",
+	output, err := runCmdGCTestHelper(
+		[]string{"-test.run=TestManagedDoltScopeWatchdogHelper", "-test.v"},
+		sanitizedBaseEnv(
+			"GC_TEST_MANAGED_DOLT_HELPER=scope-watchdog",
+			"GC_TEST_MANAGED_DOLT_HELPER_STATE="+statePath,
+			"GC_TEST_MANAGED_DOLT_HELPER_CONFIG="+configPath,
+			"GC_TEST_MANAGED_DOLT_HELPER_LOG="+logPath,
+			"GC_TEST_MANAGED_DOLT_HELPER_FAKE_DOLT_DIR="+fakeDoltDir,
+			// TestMain scrubs non-GC_TEST_ GC_* keys, so the interval rides a
+			// GC_TEST_ control var and the helper re-exports it for the watchdog.
+			"GC_TEST_MANAGED_DOLT_HELPER_SCOPE_WD_INTERVAL_MS=50",
+		),
 	)
-	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("helper failed: %v\n%s", err, output)
 	}

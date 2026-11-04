@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,7 +15,6 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
-	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 type crossProcessRuntimeState struct {
@@ -53,15 +51,15 @@ func (p *crossProcessConditionalProvider) StopIfCurrent(name string, identity ru
 	// controller's typed-row check but before this provider compares identity.
 	// A provider-owned compare-and-stop must observe the replacement and refuse.
 	p.once.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), testutil.ExecRaceTimeout)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCrossProcessLifecycleReplacementHelper$")
-		cmd.Env = append(os.Environ(),
-			"GASCITY_LIFECYCLE_REPLACEMENT_HELPER=1",
-			"GASCITY_LIFECYCLE_REPLACEMENT_STATE="+p.statePath,
-			"GASCITY_LIFECYCLE_REPLACEMENT_SESSION="+p.sessionID,
+		output, err := runCmdGCTestHelper(
+			[]string{"-test.run=^TestCrossProcessLifecycleReplacementHelper$"},
+			append(os.Environ(),
+				"GASCITY_LIFECYCLE_REPLACEMENT_HELPER=1",
+				"GASCITY_LIFECYCLE_REPLACEMENT_STATE="+p.statePath,
+				"GASCITY_LIFECYCLE_REPLACEMENT_SESSION="+p.sessionID,
+			),
 		)
-		if output, err := cmd.CombinedOutput(); err != nil {
+		if err != nil {
 			p.childErr = fmt.Errorf("replacement helper: %w: %s", err, strings.TrimSpace(string(output)))
 		}
 	})

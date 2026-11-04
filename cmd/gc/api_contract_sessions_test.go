@@ -169,9 +169,16 @@ func contractSessionsFamily(t *testing.T, h *contractHarness) {
 	stopped, err := c.PostV0CityByCityNameSessionByIdStopWithResponse(ctx, city, sess.Id,
 		&genclient.PostV0CityByCityNameSessionByIdStopParams{XGCRequest: contractCSRF})
 	expectStatus(t, "stop session", stopped, err, http.StatusOK)
-	killed, err := c.PostV0CityByCityNameSessionByIdKillWithResponse(ctx, city, sess.Id,
+	killSession := h.createAgentSession(t, "contract kill")
+	if !h.sp.IsRunning(killSession.SessionName) {
+		t.Fatalf("kill fixture runtime %s is not running before kill", killSession.SessionName)
+	}
+	killed, err := c.PostV0CityByCityNameSessionByIdKillWithResponse(ctx, city, killSession.Id,
 		&genclient.PostV0CityByCityNameSessionByIdKillParams{XGCRequest: contractCSRF})
 	expectStatus(t, "kill session", killed, err, http.StatusOK)
+	if h.sp.IsRunning(killSession.SessionName) {
+		t.Fatalf("kill fixture runtime %s is still running after kill", killSession.SessionName)
+	}
 	closed, err := c.PostV0CityByCityNameSessionByIdCloseWithResponse(ctx, city, sess.Id,
 		&genclient.PostV0CityByCityNameSessionByIdCloseParams{XGCRequest: contractCSRF})
 	expectStatus(t, "close session", closed, err, http.StatusOK)

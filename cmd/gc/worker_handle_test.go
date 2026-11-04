@@ -16,7 +16,6 @@ import (
 	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
-	tmuxruntime "github.com/gastownhall/gascity/internal/runtime/tmux"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/gastownhall/gascity/internal/worker"
@@ -37,6 +36,7 @@ func (s *failingSessionLookupStore) List(beads.ListQuery) ([]beads.Bead, error) 
 
 func TestWorkerHandleForSessionWithConfigUsesResolvedProviderOnFirstStart(t *testing.T) {
 	skipSlowCmdGCTest(t, "waits through stale session-key detection; run make test-cmd-gc-process for full coverage")
+	t.Run("fresh fallback prompt provider receipt", assertResolvedWorkerRuntimeFreshFallbackPromptProviderReceipt)
 	cityDir := t.TempDir()
 	writePhase0InterfaceCity(t, cityDir, `[workspace]
 name = "test-city"
@@ -1106,8 +1106,8 @@ func TestResolvedWorkerRuntimeFreshFallbackOversizedPromptUsesNudge(t *testing.T
 	}
 }
 
-func TestResolvedWorkerRuntimeFreshFallbackPromptProviderReceipt(t *testing.T) {
-	skipSlowCmdGCTest(t, "starts a private tmux server; run make test-cmd-gc-process for full coverage")
+func assertResolvedWorkerRuntimeFreshFallbackPromptProviderReceipt(t *testing.T) {
+	t.Helper()
 	cityDir := t.TempDir()
 	fakeCodex := filepath.Join(cityDir, "fake-codex")
 	argsReceipt := filepath.Join(cityDir, "provider-argv")
@@ -1160,12 +1160,22 @@ IFS= read -r ignored || true
 	launch.Env["GC_PROVIDER_STDIN"] = stdinReceipt
 	launch.Env["GC_PROVIDER_MARKER"] = markerReceipt
 	socket := fmt.Sprintf("gcprompt-%d-%x", os.Getpid(), time.Now().UnixNano())
-	provider := tmuxruntime.NewProviderWithConfig(tmuxruntime.Config{SocketName: socket, SetupTimeout: 5 * time.Second})
+	provider, err := newSessionProviderForCityByName(cfg, "tmux", config.SessionConfig{
+		Socket:       socket,
+		SetupTimeout: "5s",
+	}, cfg.Workspace.Name, info.WorkDir)
+	if err != nil {
+		t.Fatalf("construct tmux session provider: %v", err)
+	}
+	teardown, ok := provider.(interface{ TeardownServer() error })
+	if !ok {
+		t.Fatalf("tmux session provider %T does not expose server teardown", provider)
+	}
 	const sessionName = "fresh-prompt-receipt"
-	defer func() {
+	t.Cleanup(func() {
 		_ = provider.Stop(sessionName)
-		_ = provider.TeardownServer()
-	}()
+		_ = teardown.TeardownServer()
+	})
 	if err := provider.Start(context.Background(), sessionName, launch); err != nil {
 		t.Fatalf("provider Start: %v", err)
 	}
