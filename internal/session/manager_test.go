@@ -795,10 +795,19 @@ func TestRuntimeStartCallSitesCleanOrphansFirst(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read %s: %v", tt.file, err)
 			}
+			// The only direct provider call is inside the preparation boundary;
+			// every caller of that boundary remains guarded by orphan cleanup.
+			wantProviderCalls := 0
+			if tt.file == "manager.go" {
+				wantProviderCalls = 1
+			}
+			if got := strings.Count(string(data), "m.sp.Start(ctx, sessName, cfg)"); got != wantProviderCalls {
+				t.Fatalf("%s has %d direct provider starts, want %d", tt.file, got, wantProviderCalls)
+			}
 			lines := strings.Split(string(data), "\n")
 			starts := 0
 			for i, line := range lines {
-				if !strings.Contains(line, "m.sp.Start(ctx, sessName, cfg)") {
+				if !strings.Contains(line, "m.startRuntime(ctx,") {
 					continue
 				}
 				starts++
@@ -811,7 +820,7 @@ func TestRuntimeStartCallSitesCleanOrphansFirst(t *testing.T) {
 				}
 			}
 			if starts == 0 {
-				t.Fatalf("%s contains no m.sp.Start(ctx, sessName, cfg) call sites", tt.file)
+				t.Fatalf("%s contains no m.startRuntime call sites", tt.file)
 			}
 		})
 	}
@@ -5884,5 +5893,50 @@ func TestTranscriptPathZCodeResolvesEachSeatByBeadID(t *testing.T) {
 		if got != want {
 			t.Fatalf("TranscriptPath(%s) = %q, want %q", infos[i].ID, got, want)
 		}
+	}
+}
+
+func TestRuntimeStartPreparationFailureDoesNotCallProvider(t *testing.T) {
+	for _, operation := range []string{"start", "runtime-only", "attach", "create"} {
+		t.Run(operation, func(t *testing.T) {
+			store := beads.NewMemStore()
+			sp := runtime.NewFake()
+			prepareErr := errors.New("preparation failed")
+			calls := 0
+			mgr := NewManagerWithOptions(store, sp, WithRuntimeStartPreparer(func(info Info, persisted PersistedResponse, cfg *runtime.Config) error {
+				calls++
+				if sp.CountCalls("Start", info.SessionName) != 0 {
+					t.Error("provider started before preparation")
+				}
+				if cfg.WorkDir != "/work" || cfg.Command != "stub" || cfg.Env["GC_SESSION_ID"] != info.ID || persisted.Metadata["template"] != info.Template {
+					t.Errorf("preparer received incomplete launch context: %#v", cfg)
+				}
+				return prepareErr
+			}))
+			spec := CreateOptions{BeadOnly: operation != "create", Template: "worker", Command: "stub", WorkDir: "/work", Provider: "stub"}
+			info, err := mgr.CreateSession(context.Background(), spec)
+			if operation != "create" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				hints := runtime.Config{WorkDir: "/work"}
+				switch operation {
+				case "start":
+					err = mgr.Start(context.Background(), info.ID, "stub", hints)
+				case "runtime-only":
+					err = mgr.StartRuntimeOnly(context.Background(), info.ID, "stub", hints)
+				case "attach":
+					err = mgr.Attach(context.Background(), info.ID, "stub", hints)
+				}
+			}
+			if !errors.Is(err, prepareErr) || calls != 1 {
+				t.Fatalf("preparation result: err=%v calls=%d", err, calls)
+			}
+			for _, call := range sp.Calls {
+				if call.Method == "Start" {
+					t.Fatal("provider Start called after preparation failed")
+				}
+			}
+		})
 	}
 }

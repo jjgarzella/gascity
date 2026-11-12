@@ -11,6 +11,8 @@ import (
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/hooks"
 	"github.com/gastownhall/gascity/internal/materialize"
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -101,9 +103,49 @@ func workerFactoryWithResolver(
 		UsageSink:               usageSinkForCity(cfg, cityPath),
 		ResolveTransport:        resolveTransport,
 		ResolveSessionRuntime:   resolveSessionRuntime,
+		PrepareRuntimeStart:     workerRuntimeStartPreparerWithConfig(cityPath, cfg),
 		StaleKeyDetectionWaiter: waiter,
 		Pricing:                 cfg.PricingRegistry(),
 	})
+}
+
+// workerRuntimeStartPreparerWithConfig keeps configured hook generation out of
+// read resolution and supplies it at the session-owned authorized start boundary.
+func workerRuntimeStartPreparerWithConfig(cityPath string, cfg *config.City) session.RuntimeStartPreparer {
+	if cfg == nil {
+		return nil
+	}
+	return func(info session.Info, persisted session.PersistedResponse, start *runtime.Config) error {
+		agentCfg := findAgentByTemplate(cfg, info.Template)
+		if info.SessionKey != "" || agentCfg == nil || strings.TrimSpace(agentCfg.PromptTemplate) == "" {
+			return nil
+		}
+		metadata := persisted.Metadata
+		sessionKind := strings.TrimSpace(metadata["real_world_app_session_kind"])
+		resolved, configuredTransport := resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg, info, sessionKind, metadata)
+		if resolved == nil {
+			return nil
+		}
+		transport := resolvedWorkerRuntimeTransport(info, resolved, configuredTransport, metadata)
+		if transport == "" && startedConfigHashProvesWorkerACPTransport(cityPath, cfg, info, sessionKind, resolved, metadata, configuredTransport) {
+			transport = config.SessionTransportACP
+		}
+		if transport == config.SessionTransportACP {
+			return nil
+		}
+		resolver := func(name string) string { return config.BuiltinFamily(name, cfg.Providers) }
+		if err := hooks.InstallWithResolver(fsys.OSFS{}, cityPath, start.WorkDir, start.InstallAgentHooks, resolver); err != nil {
+			return err
+		}
+		settings, err := ensureClaudeSettingsArgs(fsys.OSFS{}, cityPath, start.ProviderName, nil)
+		if err != nil {
+			return err
+		}
+		if settings != "" && !storedCommandHasSettingsArg(start.Command) {
+			start.Command += " " + settings
+		}
+		return nil
+	}
 }
 
 func workerSessionRuntimeResolverWithConfig(cityPath string, cfg *config.City) worker.SessionRuntimeResolver {
@@ -182,6 +224,7 @@ func applyWorkerOverlayHints(hints *runtime.Config, cfg *config.City, cityPath, 
 		return
 	}
 	hints.InstallAgentHooks = config.ResolveInstallHooks(agentCfg, &cfg.Workspace)
+	hints.OverlayDir = resolveOverlayDir(agentCfg.OverlayDir, cityPath)
 	rigName := sessionSetupContextForAgent(cityPath, cfg.EffectiveCityName(), firstNonEmptyGCString(agentCfg.QualifiedName(), template), agentCfg, cfg.Rigs).Rig
 	hints.PackOverlayDirs = effectiveOverlayDirs(cfg.PackOverlayDirs, cfg.RigOverlayDirs, rigName)
 }
@@ -797,7 +840,7 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	// routes through resolveTemplate (gc-6bw8o).
 	applyWorkerOverlayHints(&runtimeHints, cfg, cityPath, info.Template, resolved)
 	if strings.TrimSpace(info.SessionKey) == "" && transport != config.SessionTransportACP {
-		promptHints, err := workerFreshStartPromptHints(cityPath, cfg, info)
+		promptHints, err := workerFreshStartPromptHints(cityPath, cfg, info, workDir, resolved)
 		if err != nil {
 			return nil, fmt.Errorf("resolving fresh-start prompt: %w", err)
 		}
@@ -822,7 +865,7 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 // for a resume request that has no provider session key and therefore starts a
 // new conversation. A keyed resume leaves startup delivery to the provider's
 // resume/session-start behavior so it does not inject the initial prompt twice.
-func workerFreshStartPromptHints(cityPath string, cfg *config.City, info session.Info) (runtime.Config, error) {
+func workerFreshStartPromptHints(cityPath string, cfg *config.City, info session.Info, workDir string, resolved *config.ResolvedProvider) (runtime.Config, error) {
 	if cfg == nil {
 		return runtime.Config{}, nil
 	}
@@ -832,9 +875,21 @@ func workerFreshStartPromptHints(cityPath string, cfg *config.City, info session
 	}
 	qualifiedName := firstNonEmptyGCString(info.AgentName, info.Template)
 	params := newAgentBuildParams(cfg.EffectiveCityName(), cityPath, cfg, nil, time.Now().UTC(), nil, nil)
-	tp, err := resolveTemplateForSessionBeadInfo(params, agentCfg, qualifiedName, nil, info)
-	if err != nil {
-		return runtime.Config{}, err
+	nudge := agentCfg.Nudge
+	if suppressStartupPromptForAgent(agentCfg) {
+		nudge = ""
+	}
+	tp := TemplateParams{
+		Prompt:                   renderTemplateStartupPrompt(params, agentCfg, qualifiedName, workDir, resolved.Name),
+		Env:                      map[string]string{},
+		WorkDir:                  workDir,
+		SessionName:              info.SessionName,
+		InstanceName:             qualifiedName,
+		TemplateName:             templateNameFor(agentCfg, qualifiedName),
+		ResolvedProvider:         resolved,
+		Hints:                    agent.StartupHints{Nudge: nudge},
+		EffectiveSessionProvider: effectiveSessionProvider(agentCfg.Session, cfg.Session.Provider),
+		CityRuntimes:             cfg.Runtimes,
 	}
 	promptConfig, _, err := templateParamsToConfigWithDelivery(tp)
 	if err != nil {

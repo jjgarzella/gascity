@@ -28,6 +28,9 @@ type FactoryConfig struct {
 	UsageSink             usage.Sink
 	ResolveTransport      func(template, provider string) string
 	ResolveSessionRuntime SessionRuntimeResolver
+	// PrepareRuntimeStart runs after session eligibility and orphan cleanup, just
+	// before provider Start. Handle resolution and observation never invoke it.
+	PrepareRuntimeStart sessionpkg.RuntimeStartPreparer
 	// StaleKeyDetectionWaiter supplies the session lifecycle signal used before
 	// a keyed start is probed for stale resume-key failure. Nil preserves the
 	// session package production timer.
@@ -73,6 +76,9 @@ func NewFactory(cfg FactoryConfig) (*Factory, error) {
 	}
 	if cfg.StaleKeyDetectionWaiter != nil {
 		opts = append(opts, sessionpkg.WithStaleKeyDetectionWaiter(cfg.StaleKeyDetectionWaiter))
+	}
+	if cfg.PrepareRuntimeStart != nil {
+		opts = append(opts, sessionpkg.WithRuntimeStartPreparer(cfg.PrepareRuntimeStart))
 	}
 	manager := sessionpkg.NewManagerWithOptions(cfg.Store, cfg.Provider, opts...)
 	return newFactory(manager, cfg)

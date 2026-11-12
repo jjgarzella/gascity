@@ -585,6 +585,7 @@ type Manager struct {
 	transportResolver       func(template, provider string) transportResolution
 	clk                     clock.Clock
 	staleKeyDetectionWaiter StaleKeyDetectionWaiter
+	runtimeStartPreparer    RuntimeStartPreparer
 }
 
 // PruneResult reports which sessions were pruned and which queued wait nudges
@@ -824,6 +825,27 @@ func WithStaleKeyDetectionWaiter(waiter StaleKeyDetectionWaiter) ManagerOption {
 	}
 }
 
+// RuntimeStartPreparer prepares launch files and command arguments after session
+// eligibility and orphan cleanup, immediately before the provider starts.
+// Persisted facts are read-only; the preparer may update the runtime config.
+// It is never called when constructing or observing a session handle.
+type RuntimeStartPreparer func(Info, PersistedResponse, *runtime.Config) error
+
+// WithRuntimeStartPreparer installs the composition-owned runtime preparation
+// step. A nil preparer preserves the provider's existing start behavior.
+func WithRuntimeStartPreparer(prepare RuntimeStartPreparer) ManagerOption {
+	return func(m *Manager) { m.runtimeStartPreparer = prepare }
+}
+
+func (m *Manager) startRuntime(ctx context.Context, b beads.Bead, sessName string, cfg runtime.Config) error {
+	if m.runtimeStartPreparer != nil {
+		if err := m.runtimeStartPreparer(infoFromPersistedBead(b), PersistedResponseFromBead(b), &cfg); err != nil {
+			return fmt.Errorf("preparing runtime start: %w", err)
+		}
+	}
+	return m.sp.Start(ctx, sessName, cfg)
+}
+
 // WithClock supplies the time source the Manager stamps lifecycle timestamps
 // from (e.g. pending_create_started_at). A nil clock retains the immutable
 // production wall clock.
@@ -1026,7 +1048,7 @@ func (m *Manager) createStarted(ctx context.Context, spec CreateOptions) (Info, 
 			}
 			return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 		}
-		if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+		if err := m.startRuntime(ctx, b, sessName, cfg); err != nil {
 			if runtimeSessionMatchesBead(m.sp, sessName, b.ID, meta["instance_token"]) {
 				if metaErr := m.confirmStartedRuntimeMetadata(b.ID, &b); metaErr != nil {
 					return metaErr

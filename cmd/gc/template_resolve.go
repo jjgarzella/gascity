@@ -356,127 +356,14 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 
 	// configDir is the directory agent config-relative paths (pre-start
 	// scripts, session setup templates, and {{.ConfigDir}} in prompts)
-	// resolve against. Computed once, ahead of Step 9's prompt render, so
-	// the PromptContext and Step 11's SessionSetupContext agree (#5315).
+	// resolve against. Startup prompt rendering uses the same resolver so
+	// PromptContext and Step 11's SessionSetupContext agree (#5315).
 	configDir := resolveConfigDir(p.cityPath, cfgAgent.SourceDir)
 
-	// Step 9: Render prompt with beacon.
-	var prompt string
-	// Merge fragment sources: V1 global_fragments + inject_fragments,
-	// per-agent append_fragments, imported-pack [agent_defaults].append_fragments,
-	// then city-level [agent_defaults].append_fragments.
-	fragments := effectivePromptFragments(
-		p.globalFragments,
-		cfgAgent.InjectFragments,
-		cfgAgent.AppendFragments,
-		cfgAgent.InheritedAppendFragments,
-		p.appendFragments,
-	)
-	providerKey, providerDisplayName := providerInfoForAgent(cfgAgent, p.workspace, p.providers)
-	packDirs := p.packDirs
-	if p.city != nil {
-		packDirs = p.city.PackDirsForRig(rigName)
-	}
-	topo := config.QueryTopology{}
-	if p.city != nil {
-		topo.Beads = p.city.Beads
-	}
-	// Controller-owned: config.QueryTopology{Beads: ...} and NOT
-	// cityQueryTopology. Resolving the federation fact means asking the
-	// storage routes, and the one-shot funnel that answers for a CLI command
-	// (cliStorageRoutes) is explicitly for the half of the program that
-	// "never builds a CityRuntime" — a controller reaching it would open the
-	// city's binding a second time in a process that already holds it open.
-	// The controller's own routes are the right source; threading them into
-	// this plumbing is a change to controller wiring, not part of swapping
-	// the reader, so it stays with the claim-routing slice (ga-601v2).
-	prompt = renderPrompt(p.fs, p.cityPath, p.cityName, cfgAgent.PromptTemplate, PromptContext{
-		CityRoot:                p.cityPath,
-		AgentName:               qualifiedName,
-		TemplateName:            cfgAgent.Name,
-		BindingName:             cfgAgent.BindingName,
-		BindingPrefix:           cfgAgent.BindingPrefix(),
-		RigName:                 rigName,
-		RigRoot:                 rigRoot,
-		WorkDir:                 workDir,
-		IssuePrefix:             findRigPrefix(rigName, p.rigs),
-		DefaultBranch:           defaultBranchForRig(rigName, p.rigs, workDir),
-		AssignedInProgressQuery: expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "assigned_in_progress_query", cfgAgent.EffectiveAssignedInProgressQueryFor(topo), p.stderr),
-		AssignedReadyQuery:      expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "assigned_ready_query", cfgAgent.EffectiveAssignedReadyQueryFor(topo), p.stderr),
-		RoutedPoolQuery:         expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "routed_pool_query", cfgAgent.EffectiveRoutedPoolQueryFor(topo), p.stderr),
-		WorkQuery:               expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "work_query", cfgAgent.EffectiveWorkQueryFor(topo), p.stderr),
-		SlingQuery:              expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "sling_query", cfgAgent.EffectiveSlingQuery(), p.stderr),
-		ProviderKey:             providerKey,
-		ProviderDisplayName:     providerDisplayName,
-		InstructionsFile:        instructionsFileForAgent(cfgAgent, p.workspace, p.providers),
-		ConfigDir:               configDir,
-		Env:                     cfgAgent.Env,
-	}, p.sessionTemplate, p.stderr, packDirs, fragments, p.beadStore)
+	// Step 9: Read startup context using the directory resolved for this runtime.
 	hasHooks := config.AgentHasHooks(cfgAgent, p.workspace, resolved.Name, p.providers)
 	suppressStartupPrompt := suppressStartupPromptForAgent(cfgAgent)
-	// The prime instruction tells a non-hook agent to go fetch its context.
-	// That is only meaningful when the beacon ships alone (the default branch
-	// below): when the rendered prompt is inlined under the beacon, the agent
-	// already holds the exact bytes `gc prime` would hand back, so the
-	// instruction costs a turn and duplicates the context it just received.
-	includePrimeInstruction := !hasHooks && prompt == ""
-	beacon := runtime.FormatBeaconAt(p.cityName, qualifiedName, includePrimeInstruction, p.beaconTime)
-	switch {
-	case suppressStartupPrompt:
-		prompt = ""
-	case prompt != "":
-		prompt = beacon + "\n\n" + prompt
-	default:
-		prompt = beacon
-	}
-
-	// Step 9b: Append the assigned-skills appendix when the agent
-	// has a vendor sink, hasn't opted out, AND the runtime actually
-	// delivers the skills to the session workdir. The appendix claims
-	// "these skills are materialized in your provider's skill
-	// directory and load automatically" — that claim has to match
-	// reality, so we gate on the same availability conditions as
-	// materialization itself:
-	//
-	//   - Stage-1-eligible runtime + workdir == scope root: stage 1
-	//     wrote the sink into the scope root the agent sees.
-	//   - Stage-2-eligible runtime (regardless of workdir): the
-	//     session PreStart invokes `gc internal materialize-skills`
-	//     into the session workdir before the agent starts.
-	//
-	// Agents for which neither path delivers (ACP, k8s, hybrid,
-	// subprocess with WorkDir ≠ scope root — because subprocess
-	// doesn't execute PreStart) get no appendix; we'd be lying to
-	// them. Discovered via the pass-1 Codex review.
-	if !suppressStartupPrompt && effectiveInjectAssignedSkills(cfgAgent) {
-		wsProvider := ""
-		if p.workspace != nil {
-			wsProvider = p.workspace.Provider
-		}
-		provider := effectiveAgentProviderFamily(cfgAgent, wsProvider, p.providers)
-		if _, ok := materialize.VendorSink(provider); ok {
-			scopeRoot := agentScopeRoot(cfgAgent, p.cityPath, p.rigs)
-			canonWorkDir := canonicaliseFilePath(workDir, p.cityPath)
-			stage1Delivers := canStage1Materialize(p.sessionProvider, cfgAgent) && canonWorkDir == scopeRoot
-			stage2Delivers := isStage2EligibleSession(p.sessionProvider, cfgAgent)
-			if stage1Delivers || stage2Delivers {
-				var agentCat materialize.AgentCatalog
-				if cfgAgent.SkillsDir != "" {
-					// Best-effort: a transient I/O failure loading the
-					// agent catalog shouldn't break the prompt render.
-					// The error is already surfaced via
-					// effectiveSkillsForAgent's stderr path earlier in
-					// the call graph.
-					if c, err := materialize.LoadAgentCatalog(cfgAgent.SkillsDir); err == nil {
-						agentCat = c
-					}
-				}
-				if frag := buildAssignedSkillsPromptFragment(cfgAgent, p.sharedSkillCatalogForAgent(cfgAgent), agentCat); frag != "" {
-					prompt = prompt + "\n\n" + frag
-				}
-			}
-		}
-	}
+	prompt := renderTemplateStartupPrompt(p, cfgAgent, qualifiedName, workDir, resolved.Name)
 
 	// Step 10: Merge environment layers. Workspace.Env sits between
 	// passthrough and provider so a per-provider/agent/patch entry can
@@ -762,6 +649,132 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		params.CityRuntimes = p.city.Runtimes
 	}
 	return params, nil
+}
+
+// renderTemplateStartupPrompt reads startup instructions for the resolved runtime
+// directory without preparing overlays, hooks, settings, or runtime files.
+func renderTemplateStartupPrompt(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName, workDir, providerName string) string {
+	dirCtx := sessionSetupContextForAgent(p.cityPath, p.cityName, qualifiedName, cfgAgent, p.rigs)
+	rigName, rigRoot := dirCtx.Rig, dirCtx.RigRoot
+	configDir := resolveConfigDir(p.cityPath, cfgAgent.SourceDir)
+	var prompt string
+	// Merge fragment sources: V1 global_fragments + inject_fragments,
+	// per-agent append_fragments, imported-pack [agent_defaults].append_fragments,
+	// then city-level [agent_defaults].append_fragments.
+	fragments := effectivePromptFragments(
+		p.globalFragments,
+		cfgAgent.InjectFragments,
+		cfgAgent.AppendFragments,
+		cfgAgent.InheritedAppendFragments,
+		p.appendFragments,
+	)
+	providerKey, providerDisplayName := providerInfoForAgent(cfgAgent, p.workspace, p.providers)
+	packDirs := p.packDirs
+	if p.city != nil {
+		packDirs = p.city.PackDirsForRig(rigName)
+	}
+	topo := config.QueryTopology{}
+	if p.city != nil {
+		topo.Beads = p.city.Beads
+	}
+	// Controller-owned: config.QueryTopology{Beads: ...} and NOT
+	// cityQueryTopology. Resolving the federation fact means asking the
+	// storage routes, and the one-shot funnel that answers for a CLI command
+	// (cliStorageRoutes) is explicitly for the half of the program that
+	// "never builds a CityRuntime" — a controller reaching it would open the
+	// city's binding a second time in a process that already holds it open.
+	// The controller's own routes are the right source; threading them into
+	// this plumbing is a change to controller wiring, not part of swapping
+	// the reader, so it stays with the claim-routing slice (ga-601v2).
+	prompt = renderPrompt(p.fs, p.cityPath, p.cityName, cfgAgent.PromptTemplate, PromptContext{
+		CityRoot:                p.cityPath,
+		AgentName:               qualifiedName,
+		TemplateName:            cfgAgent.Name,
+		BindingName:             cfgAgent.BindingName,
+		BindingPrefix:           cfgAgent.BindingPrefix(),
+		RigName:                 rigName,
+		RigRoot:                 rigRoot,
+		WorkDir:                 workDir,
+		IssuePrefix:             findRigPrefix(rigName, p.rigs),
+		DefaultBranch:           defaultBranchForRig(rigName, p.rigs, workDir),
+		AssignedInProgressQuery: expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "assigned_in_progress_query", cfgAgent.EffectiveAssignedInProgressQueryFor(topo), p.stderr),
+		AssignedReadyQuery:      expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "assigned_ready_query", cfgAgent.EffectiveAssignedReadyQueryFor(topo), p.stderr),
+		RoutedPoolQuery:         expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "routed_pool_query", cfgAgent.EffectiveRoutedPoolQueryFor(topo), p.stderr),
+		WorkQuery:               expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "work_query", cfgAgent.EffectiveWorkQueryFor(topo), p.stderr),
+		SlingQuery:              expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "sling_query", cfgAgent.EffectiveSlingQuery(), p.stderr),
+		ProviderKey:             providerKey,
+		ProviderDisplayName:     providerDisplayName,
+		InstructionsFile:        instructionsFileForAgent(cfgAgent, p.workspace, p.providers),
+		ConfigDir:               configDir,
+		Env:                     cfgAgent.Env,
+	}, p.sessionTemplate, p.stderr, packDirs, fragments, p.beadStore)
+	hasHooks := config.AgentHasHooks(cfgAgent, p.workspace, providerName, p.providers)
+	suppressStartupPrompt := suppressStartupPromptForAgent(cfgAgent)
+	// The prime instruction tells a non-hook agent to go fetch its context.
+	// That is only meaningful when the beacon ships alone (the default branch
+	// below): when the rendered prompt is inlined under the beacon, the agent
+	// already holds the exact bytes `gc prime` would hand back, so the
+	// instruction costs a turn and duplicates the context it just received.
+	includePrimeInstruction := !hasHooks && prompt == ""
+	beacon := runtime.FormatBeaconAt(p.cityName, qualifiedName, includePrimeInstruction, p.beaconTime)
+	switch {
+	case suppressStartupPrompt:
+		prompt = ""
+	case prompt != "":
+		prompt = beacon + "\n\n" + prompt
+	default:
+		prompt = beacon
+	}
+
+	// Append the assigned-skills appendix when the agent
+	// has a vendor sink, hasn't opted out, AND the runtime actually
+	// delivers the skills to the session workdir. The appendix claims
+	// "these skills are materialized in your provider's skill
+	// directory and load automatically" — that claim has to match
+	// reality, so we gate on the same availability conditions as
+	// materialization itself:
+	//
+	//   - Stage-1-eligible runtime + workdir == scope root: stage 1
+	//     wrote the sink into the scope root the agent sees.
+	//   - Stage-2-eligible runtime (regardless of workdir): the
+	//     session PreStart invokes `gc internal materialize-skills`
+	//     into the session workdir before the agent starts.
+	//
+	// Agents for which neither path delivers (ACP, k8s, hybrid,
+	// subprocess with WorkDir ≠ scope root — because subprocess
+	// doesn't execute PreStart) get no appendix; we'd be lying to
+	// them. Discovered via the pass-1 Codex review.
+	if !suppressStartupPrompt && effectiveInjectAssignedSkills(cfgAgent) {
+		wsProvider := ""
+		if p.workspace != nil {
+			wsProvider = p.workspace.Provider
+		}
+		provider := effectiveAgentProviderFamily(cfgAgent, wsProvider, p.providers)
+		if _, ok := materialize.VendorSink(provider); ok {
+			scopeRoot := agentScopeRoot(cfgAgent, p.cityPath, p.rigs)
+			canonWorkDir := canonicaliseFilePath(workDir, p.cityPath)
+			stage1Delivers := canStage1Materialize(p.sessionProvider, cfgAgent) && canonWorkDir == scopeRoot
+			stage2Delivers := isStage2EligibleSession(p.sessionProvider, cfgAgent)
+			if stage1Delivers || stage2Delivers {
+				var agentCat materialize.AgentCatalog
+				if cfgAgent.SkillsDir != "" {
+					// Best-effort: a transient I/O failure loading the
+					// agent catalog shouldn't break the prompt render.
+					// The error is already surfaced via
+					// effectiveSkillsForAgent's stderr path earlier in
+					// the call graph.
+					if c, err := materialize.LoadAgentCatalog(cfgAgent.SkillsDir); err == nil {
+						agentCat = c
+					}
+				}
+				if frag := buildAssignedSkillsPromptFragment(cfgAgent, p.sharedSkillCatalogForAgent(cfgAgent), agentCat); frag != "" {
+					prompt = prompt + "\n\n" + frag
+				}
+			}
+		}
+	}
+
+	return prompt
 }
 
 // isOperationalScript reports whether rel (a slash-separated path relative to

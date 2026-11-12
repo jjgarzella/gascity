@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1086,6 +1087,135 @@ func TestResolvedWorkerRuntimeFreshFallbackPromptDelivery(t *testing.T) {
 	}
 	if got := resumed.Hints.Env[startupPromptDeliveredEnv]; got != "" {
 		t.Fatalf("valid resume delivery marker = %q, want empty", got)
+	}
+}
+
+// Session observation and rejected lifecycle work must leave startup files alone.
+func TestWorkerFreshFallbackDoesNotPrepareFilesBeforeStart(t *testing.T) {
+	for _, operation := range []string{"observe", "refused attach", "stale conditional kill"} {
+		t.Run(operation, func(t *testing.T) {
+			cfg, fixture, _ := workerPromptFixture(t, "/bin/echo", "read-only bootstrap")
+			cityDir := fixture.WorkDir
+			cfg.Agents[0].Provider = "claude"
+			cfg.Providers["claude"] = config.ProviderSpec{Command: "/bin/echo", PromptMode: "arg"}
+			cfg.Agents[0].InstallAgentHooks = []string{"claude", "codex"}
+			overlay := t.TempDir()
+			cfg.Agents[0].OverlayDir = overlay
+			const sentinel = "startup-overlay.txt"
+			if err := os.WriteFile(filepath.Join(overlay, sentinel), []byte("authorized start overlay"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			store := beads.NewMemStore()
+			sp := runtime.NewFake()
+			mgr := session.NewManagerWithOptions(store, sp)
+			info, err := mgr.CreateSession(context.Background(), session.CreateOptions{
+				BeadOnly: true, Template: "worker", Command: "/bin/echo", WorkDir: cityDir, Provider: "claude",
+				ExtraMeta: map[string]string{"agent_name": "worker", "session_origin": "manual"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch operation {
+			case "observe":
+				_, err = workerObserveSessionTargetWithRuntimeHintsWithConfig(cityDir, store, sp, cfg, info.ID, nil)
+			case "refused attach":
+				if err := store.SetMetadataBatch(info.ID, map[string]string(session.DrainAckStopPendingPatch(time.Now().UTC()))); err != nil {
+					t.Fatal(err)
+				}
+				handle, buildErr := workerHandleForSessionWithConfig(cityDir, store, sp, cfg, info.ID)
+				if buildErr != nil {
+					t.Fatal(buildErr)
+				}
+				if attachErr := handle.Attach(context.Background()); attachErr == nil {
+					t.Fatal("draining session attach succeeded")
+				}
+			case "stale conditional kill":
+				var stopped bool
+				stopped, err = workerKillSessionIfCurrentWithConfig(cityDir, store, sp, cfg, info.ID, runtime.Identity{SessionID: "stale-session", RuntimeEpoch: "1"})
+				if stopped {
+					t.Fatal("stale conditional kill stopped a runtime")
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, rel := range []string{sentinel, ".gc/settings.json", ".codex/hooks.json"} {
+				if b, err := os.ReadFile(filepath.Join(cityDir, rel)); !os.IsNotExist(err) {
+					t.Errorf("%s prepared %s before start: bytes=%q err=%v", operation, rel, b, err)
+				}
+			}
+			if sp.CountCalls("Start", info.SessionName) != 0 || sp.CountCalls("Stop", info.SessionName) != 0 {
+				t.Fatal("observation or rejected lifecycle work invoked runtime start/stop")
+			}
+			// The resolved hints still carry legitimate workdir staging to the start boundary.
+			resolved, err := resolvedWorkerRuntimeWithConfig(cityDir, cfg, info, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.StageSessionWorkDir(resolved.Hints); err != nil {
+				t.Fatal(err)
+			}
+			if b, err := os.ReadFile(filepath.Join(cityDir, sentinel)); err != nil || string(b) != "authorized start overlay" {
+				t.Fatalf("start staging lost overlay: bytes=%q err=%v", b, err)
+			}
+		})
+	}
+}
+
+func TestResolvedWorkerRuntimeFreshFallbackUsesPersistedPromptContext(t *testing.T) {
+	for _, persistedAtRoot := range []bool{true, false} {
+		t.Run(fmt.Sprintf("persisted at scope root=%t", persistedAtRoot), func(t *testing.T) {
+			cfg, info, _ := workerPromptFixture(t, "/bin/echo", "WORKDIR={{.WorkDir}} IDENTITY={{.AgentName}} {{define \"directory-fragment\"}}FRAGMENT={{.WorkDir}}{{end}}")
+			cityDir := info.WorkDir
+			if err := os.Rename(filepath.Join(cityDir, cfg.Agents[0].PromptTemplate), filepath.Join(cityDir, "prompts/context.template.md")); err != nil {
+				t.Fatal(err)
+			}
+			cfg.Agents[0].PromptTemplate = "prompts/context.template.md"
+			cfg.Session.Provider = "subprocess"
+			cfg.PackSkillsDir = filepath.Join(cityDir, "skills")
+			cfg.Agents[0].Provider = "codex"
+			cfg.Agents[0].Scope = "city"
+			cfg.Agents[0].InjectFragments = []string{"directory-fragment"}
+			cfg.Providers["codex"] = config.ProviderSpec{Command: "/bin/echo", PromptMode: "arg"}
+			otherDir := filepath.Join(cityDir, "session-worktree")
+			if err := os.MkdirAll(otherDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if persistedAtRoot {
+				cfg.Agents[0].WorkDir = otherDir
+			} else {
+				cfg.Agents[0].WorkDir = cityDir
+				info.WorkDir = otherDir
+			}
+			for rel, content := range map[string]string{
+				"pack.toml":            "[pack]\nname = \"skills\"\nversion = \"0.1.0\"\nschema = 2\n",
+				"skills/plan/SKILL.md": "---\nname: plan\ndescription: Plan the work\n---\nbody\n",
+			} {
+				path := filepath.Join(cityDir, rel)
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			resolved, err := resolvedWorkerRuntimeWithConfig(cityDir, cfg, info, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resolved.WorkDir != info.WorkDir || resolved.Hints.WorkDir != info.WorkDir {
+				t.Fatalf("runtime directory changed: runtime=%q hints=%q persisted=%q", resolved.WorkDir, resolved.Hints.WorkDir, info.WorkDir)
+			}
+			for _, want := range []string{"WORKDIR=" + info.WorkDir, "FRAGMENT=" + info.WorkDir, "IDENTITY=" + info.AgentName} {
+				if !strings.Contains(resolved.Hints.PromptSuffix, want) {
+					t.Errorf("prompt missing persisted context %q: %s", want, resolved.Hints.PromptSuffix)
+				}
+			}
+			// Subprocess only receives stage-1 skills at the scope root; no stage-2 hook runs.
+			if got := strings.Contains(resolved.Hints.PromptSuffix, "`plan` — Plan the work"); got != persistedAtRoot {
+				t.Errorf("assigned-skills context present=%t, want %t for persisted workdir %q", got, persistedAtRoot, info.WorkDir)
+			}
+		})
 	}
 }
 
@@ -3076,5 +3206,154 @@ command = "/bin/echo"
 	}
 	if !strings.Contains(string(found.Payload), info.SessionName) {
 		t.Fatalf("%q payload = %s, want it to name session %q", events.WorkerOperation, string(found.Payload), info.SessionName)
+	}
+}
+
+// stagingWorkerProvider keeps lifecycle in memory and runs the production file-staging boundary.
+type stagingWorkerProvider struct{ *runtime.Fake }
+
+func (p *stagingWorkerProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	if err := runtime.StageSessionWorkDir(cfg); err != nil {
+		return err
+	}
+	return p.Fake.Start(ctx, name, cfg)
+}
+
+func TestWorkerFreshFallbackStartPreparesHooks(t *testing.T) {
+	cfg, fixture, _ := workerPromptFixture(t, "/bin/echo", "authorized startup instructions")
+	cityDir := fixture.WorkDir
+	workDir := filepath.Join(cityDir, "persisted-session-dir")
+	cfg.Agents[0].WorkDir = filepath.Join(cityDir, "configured-must-remain-absent")
+	cfg.Agents[0].Provider = "claude"
+	cfg.Providers["claude"] = config.ProviderSpec{Command: "/bin/echo", PromptMode: "arg"}
+	cfg.Agents[0].InstallAgentHooks = []string{"claude", "codex"}
+	overlay := t.TempDir()
+	cfg.Agents[0].OverlayDir = overlay
+	if err := os.WriteFile(filepath.Join(overlay, "sentinel.txt"), []byte("staged"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := beads.NewMemStore()
+	sp := &stagingWorkerProvider{runtime.NewFake()}
+	mgr := session.NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{
+		BeadOnly: true, Template: "worker", Command: "/bin/echo", WorkDir: workDir, Provider: "claude",
+		ExtraMeta: map[string]string{"agent_name": "worker", "session_origin": "manual"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := workerHandleForSessionWithConfig(cityDir, store, sp, cfg, info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{filepath.Join(cityDir, ".gc/settings.json"), filepath.Join(workDir, ".codex/hooks.json")} {
+		if _, err := os.Stat(target); !os.IsNotExist(err) {
+			t.Fatalf("handle construction prepared %s: %v", target, err)
+		}
+	}
+	if err := handle.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(workDir, "sentinel.txt")); err != nil || string(b) != "staged" {
+		t.Fatalf("start overlay = %q, err=%v", b, err)
+	}
+	for _, target := range []string{filepath.Join(cityDir, ".gc/settings.json"), filepath.Join(workDir, ".codex/hooks.json")} {
+		if data, err := os.ReadFile(target); err != nil || !json.Valid(data) {
+			t.Errorf("authorized Start missing generated hooks/settings %s: %v", target, err)
+		}
+	}
+	started := sp.LastStartConfig(info.SessionName)
+	if started == nil || started.WorkDir != workDir {
+		t.Fatalf("start = %#v, want persisted workdir %q", started, workDir)
+	}
+	settingsFound := false
+	args := shellquote.Split(started.Command)
+	for i, arg := range args {
+		if arg == "--settings" && i+1 < len(args) && args[i+1] == filepath.Join(cityDir, ".gc/settings.json") {
+			settingsFound = true
+		}
+	}
+	if !settingsFound {
+		t.Errorf("start command omitted projected settings: %q", started.Command)
+	}
+	if _, err := os.Stat(cfg.Agents[0].WorkDir); !os.IsNotExist(err) {
+		t.Fatalf("start prepared configured directory instead of persisted directory: %v", err)
+	}
+}
+
+func TestWorkerFreshFallbackSuppressedT3BridgePrompt(t *testing.T) {
+	cfg, info, _ := workerPromptFixture(t, "/bin/echo", "unused startup instructions")
+	cfg.Session.Provider = "t3bridge"
+	cfg.Agents[0].Name = config.ControlDispatcherAgentName
+	cfg.Agents[0].Provider = ""
+	cfg.Agents[0].StartCommand = config.ControlDispatcherStartCommandFor(config.ControlDispatcherAgentName)
+	info.Template = config.ControlDispatcherAgentName
+	info.AgentName = config.ControlDispatcherAgentName
+	resolved, err := resolvedWorkerRuntimeWithConfig(info.WorkDir, cfg, info, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Hints.PromptSuffix != "" || resolved.Hints.PromptFlag != "" || resolved.Hints.Nudge != "" || resolved.Hints.Env[startupPromptDeliveredEnv] != "" {
+		t.Fatal("suppressed startup prompt selected delivery or acquired a delivery marker")
+	}
+}
+
+func TestWorkerRuntimeStartPreparerKeepsMetadataBackedACPRoute(t *testing.T) {
+	cfg, info, _ := workerPromptFixture(t, "/bin/echo", "ACP startup instructions")
+	cityDir := info.WorkDir
+	cfg.Agents[0].Provider = "claude"
+	cfg.Providers["claude"] = config.ProviderSpec{Command: "/bin/echo"}
+	prepare := workerRuntimeStartPreparerWithConfig(cityDir, cfg)
+	start := runtime.Config{Command: "/bin/echo", WorkDir: cityDir, ProviderName: "claude", InstallAgentHooks: []string{"claude", "codex"}}
+	persisted := session.PersistedResponse{Metadata: map[string]string{session.MCPIdentityMetadataKey: "session-mcp-binding"}}
+	info.MCPIdentity = persisted.Metadata[session.MCPIdentityMetadataKey]
+	if err := prepare(info, persisted, &start); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{".gc/settings.json", ".codex/hooks.json"} {
+		if _, err := os.Stat(filepath.Join(cityDir, rel)); !os.IsNotExist(err) {
+			t.Fatalf("ACP route acquired CLI startup preparation at %s: %v", rel, err)
+		}
+	}
+	if start.Command != "/bin/echo" {
+		t.Fatalf("ACP command changed: %q", start.Command)
+	}
+}
+
+func TestResolvedWorkerRuntimeFreshFallbackOversizedLogIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, runtime, mode string
+		wantError           bool
+	}{
+		{name: "nudge fallback", runtime: "tmux", mode: "nudge-fallback"},
+		{name: "unsupported runtime", runtime: "subprocess", mode: "hard-fail", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, info, _ := workerPromptFixture(t, "/bin/echo", strings.Repeat("x", maxPromptSuffixRawBytes))
+			cfg.Session.Provider = tc.runtime
+			info.AgentName = "persisted-worker-42"
+			info.SessionName = "persisted-runtime-session"
+			info.SessionNameMetadata = info.SessionName
+			handler := &captureHandler{}
+			previous := slog.Default()
+			slog.SetDefault(slog.New(handler))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+			_, err := resolvedWorkerRuntimeWithConfig(info.WorkDir, cfg, info, "")
+			if (err != nil) != tc.wantError {
+				t.Fatalf("runtime resolution error = %v, want error=%t", err, tc.wantError)
+			}
+			records := oversizedPromptDeliveryLogRecords(handler.records)
+			if len(records) != 1 {
+				t.Fatalf("oversized delivery records = %d, want 1", len(records))
+			}
+			fields := recordFields(records[0])
+			for field, want := range map[string]string{
+				"agent": info.AgentName, "session": info.SessionName, "effective_mode": tc.mode,
+			} {
+				if got := fields[field].String(); got != want {
+					t.Errorf("log field %s = %q, want %q (template=%q)", field, got, want, info.Template)
+				}
+			}
+		})
 	}
 }
