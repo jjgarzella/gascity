@@ -135,7 +135,7 @@ func TestLocalParallelWithholdsTimeoutFromIntegrationJobs(t *testing.T) {
 
 // perJobEnvAllowlist captures the variable allowlist the worker shell passes
 // through `env -i` before invoking each jobspec.
-var perJobEnvAllowlist = regexp.MustCompile(`(?s)env -i \\(.*?)bash -lc`)
+var perJobEnvAllowlist = regexp.MustCompile(`(?s)env -i \\(.*?)bash -c`)
 
 // unitCoreJobCommand returns the `go test` command line the unit-core jobspec
 // hands to each worker shell, with the script's own shell variables resolved.

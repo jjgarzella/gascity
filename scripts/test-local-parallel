@@ -347,7 +347,7 @@ run_fan_out() {
     GOINSECURE="${GOINSECURE-}" \
     GOVCS="${GOVCS-}" \
     GOWORK="${GOWORK-}" \
-    bash -lc "$command" >"$log" 2>&1; then
+    bash -c "$command" >"$log" 2>&1; then
     echo "[$label] ok"
   else
     status=$?
