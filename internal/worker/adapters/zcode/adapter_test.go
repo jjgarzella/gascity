@@ -557,7 +557,7 @@ func TestIdleSeparatedPromptsStaySeparate(t *testing.T) {
 	h := newHarness(t, nil)
 	s := h.start()
 	s.send("first prompt")
-	time.Sleep(2500 * time.Millisecond)
+	s.waitForTurns(1)
 	s.send("second prompt")
 	s.waitForTurns(2)
 	if _, code := s.closeAndWait(); code != 0 {
@@ -1097,7 +1097,7 @@ func TestInterruptMidTurnContinuesTheLoop(t *testing.T) {
 	h := newHarness(t, map[string]string{"STUB_SLEEP": "5", "STUB_SID": "sess_int"})
 	s := h.start()
 	s.send("slow turn")
-	time.Sleep(3 * time.Second) // inside the stub's sleep
+	s.waitForOutput("zcode-repl turn in flight", adapterWaitBudget)
 	s.signal(syscall.SIGINT)
 	time.Sleep(2 * time.Second)
 
@@ -1171,7 +1171,7 @@ func TestInterruptWhileIdleDoesNotExit(t *testing.T) {
 
 	h := newHarness(t, nil)
 	s := h.start()
-	time.Sleep(2 * time.Second) // idle, blocked in read
+	s.waitForOutput("zcode-repl ready", adapterWaitBudget)
 	s.signal(syscall.SIGINT)
 	time.Sleep(2 * time.Second)
 
