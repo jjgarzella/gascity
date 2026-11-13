@@ -81,7 +81,10 @@ evidence from tests, source, an issue, or a commit.
   mark the adoption unbound through the session create front door, and block
   automatic conditional drain with an actionable unsupported-capability
   error. Never fill provider ID/epoch metadata with sequential name-based
-  reads and writes.
+  reads and writes. After a genuinely new successful start, retire that marker
+  only after provider-owned ID/epoch/token attestation and a current-incarnation
+  commit under the session mutation lock. Convergence onto an existing runtime
+  and ordinary controller started commits cannot retire it.
 - Direct `gc session new` starts are fresh provider conversations even when
   the provider accepts a generated session key. Route their rendered startup
   prompt through the canonical argv, flag, or nudge policy before Provider.Start

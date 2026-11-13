@@ -1,0 +1,31 @@
+# gazelle:build_tags integration
+load("@rules_go//go:def.bzl", "go_test")
+
+go_test(
+    name = "sessionidentity_test",
+    srcs = [
+        "legacy_identity_test.go",
+        "testenv_import_test.go",
+    ],
+    gotags = ["integration"],  # keep
+    tags = [
+        "integration",
+        "manual",
+    ],  # keep
+    deps = [
+        "//internal/beads",
+        "//internal/runtime",
+        "//internal/runtime/acp",
+        "//internal/session",
+        "//internal/testenv",
+        "//internal/testutil",
+    ],
+)
+
+# --- bazel_repo_srcs (managed by tools/bazel/repo_tree.py) ---
+
+filegroup(
+    name = "bazel_repo_srcs",
+    srcs = glob(["**"], exclude = ["BUILD.bazel"], allow_empty = True),
+    visibility = ["//visibility:public"],
+)

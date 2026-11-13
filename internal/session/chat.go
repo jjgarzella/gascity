@@ -674,6 +674,9 @@ func (m *Manager) ensureRunning(ctx context.Context, id string, b beads.Bead, se
 		}
 		return err
 	}
+	if started {
+		return m.retireLegacyIdentityAfterStart(b, sessName)
+	}
 	return nil
 }
 
@@ -770,10 +773,15 @@ func (m *Manager) ensureRunningRuntimeOnly(ctx context.Context, id string, b bea
 			return err
 		}
 		if !m.sp.IsRunning(sessName) {
-			if _, err := m.retryFreshStartAfterStaleKey(ctx, id, &b, sessName, resumeCommand, cfg, unroute); err != nil {
+			retried, err := m.retryFreshStartAfterStaleKey(ctx, id, &b, sessName, resumeCommand, cfg, unroute)
+			if err != nil {
 				return err
 			}
+			started = retried
 		}
+	}
+	if started {
+		return m.retireLegacyIdentityAfterStart(b, sessName)
 	}
 	return nil
 }
@@ -1042,9 +1050,9 @@ func (m *Manager) Start(ctx context.Context, id, resumeCommand string, hints run
 	})
 }
 
-// StartRuntimeOnly brings the runtime live for a bead-backed session without
-// mutating persisted lifecycle metadata. Legacy reconciler callers use this
-// bridge while they still own commit/rollback bookkeeping above the worker
+// StartRuntimeOnly brings the runtime live without committing lifecycle
+// completion. Launch identity and continuation bookkeeping remain session-owned;
+// legacy reconciler callers still own completion/rollback above the worker
 // boundary.
 func (m *Manager) StartRuntimeOnly(ctx context.Context, id, resumeCommand string, hints runtime.Config) error {
 	return withSessionMutationLock(id, func() error {
