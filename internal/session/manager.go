@@ -829,7 +829,10 @@ func WithStaleKeyDetectionWaiter(waiter StaleKeyDetectionWaiter) ManagerOption {
 // eligibility and orphan cleanup, immediately before the provider starts.
 // Persisted facts are read-only; the preparer may update the runtime config.
 // It is never called when constructing or observing a session handle.
-type RuntimeStartPreparer func(Info, PersistedResponse, *runtime.Config) error
+// freshCreate identifies Manager.CreateSession's first launch even when a
+// provider key has already been generated. It is operation context, not an
+// inference from the durable key, lifecycle state, or incomplete legacy metadata.
+type RuntimeStartPreparer func(info Info, persisted PersistedResponse, cfg *runtime.Config, freshCreate bool) error
 
 // WithRuntimeStartPreparer installs the composition-owned runtime preparation
 // step. A nil preparer preserves the provider's existing start behavior.
@@ -837,9 +840,9 @@ func WithRuntimeStartPreparer(prepare RuntimeStartPreparer) ManagerOption {
 	return func(m *Manager) { m.runtimeStartPreparer = prepare }
 }
 
-func (m *Manager) startRuntime(ctx context.Context, b beads.Bead, sessName string, cfg runtime.Config) error {
+func (m *Manager) startRuntime(ctx context.Context, b beads.Bead, sessName string, cfg runtime.Config, freshCreate bool) error {
 	if m.runtimeStartPreparer != nil {
-		if err := m.runtimeStartPreparer(infoFromPersistedBead(b), PersistedResponseFromBead(b), &cfg); err != nil {
+		if err := m.runtimeStartPreparer(infoFromPersistedBead(b), PersistedResponseFromBead(b), &cfg, freshCreate); err != nil {
 			return fmt.Errorf("preparing runtime start: %w", err)
 		}
 	}
@@ -1048,7 +1051,7 @@ func (m *Manager) createStarted(ctx context.Context, spec CreateOptions) (Info, 
 			}
 			return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 		}
-		if err := m.startRuntime(ctx, b, sessName, cfg); err != nil {
+		if err := m.startRuntime(ctx, b, sessName, cfg, true); err != nil {
 			if runtimeSessionMatchesBead(m.sp, sessName, b.ID, meta["instance_token"]) {
 				if metaErr := m.confirmStartedRuntimeMetadata(b.ID, &b); metaErr != nil {
 					return metaErr

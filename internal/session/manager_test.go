@@ -5903,17 +5903,30 @@ func TestRuntimeStartPreparationFailureDoesNotCallProvider(t *testing.T) {
 			sp := runtime.NewFake()
 			prepareErr := errors.New("preparation failed")
 			calls := 0
-			mgr := NewManagerWithOptions(store, sp, WithRuntimeStartPreparer(func(info Info, persisted PersistedResponse, cfg *runtime.Config) error {
+			mgr := NewManagerWithOptions(store, sp, WithRuntimeStartPreparer(func(info Info, persisted PersistedResponse, cfg *runtime.Config, freshCreate bool) error {
 				calls++
 				if sp.CountCalls("Start", info.SessionName) != 0 {
 					t.Error("provider started before preparation")
 				}
-				if cfg.WorkDir != "/work" || cfg.Command != "stub" || cfg.Env["GC_SESSION_ID"] != info.ID || persisted.Metadata["template"] != info.Template {
+				if freshCreate != (operation == "create") {
+					t.Errorf("fresh-create context=%t for operation %s", freshCreate, operation)
+				}
+				wantCommand := "stub"
+				if operation == "create" {
+					if info.SessionKey == "" {
+						t.Error("fresh create did not retain generated provider key in callback")
+					}
+					wantCommand += " --session-id " + info.SessionKey
+				}
+				if cfg.WorkDir != "/work" || cfg.Command != wantCommand || cfg.Env["GC_SESSION_ID"] != info.ID || persisted.Metadata["template"] != info.Template {
 					t.Errorf("preparer received incomplete launch context: %#v", cfg)
 				}
 				return prepareErr
 			}))
 			spec := CreateOptions{BeadOnly: operation != "create", Template: "worker", Command: "stub", WorkDir: "/work", Provider: "stub"}
+			if operation == "create" {
+				spec.Resume.SessionIDFlag = "--session-id"
+			}
 			info, err := mgr.CreateSession(context.Background(), spec)
 			if operation != "create" {
 				if err != nil {

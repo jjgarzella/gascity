@@ -115,23 +115,31 @@ func workerRuntimeStartPreparerWithConfig(cityPath string, cfg *config.City) ses
 	if cfg == nil {
 		return nil
 	}
-	return func(info session.Info, persisted session.PersistedResponse, start *runtime.Config) error {
+	return func(info session.Info, persisted session.PersistedResponse, start *runtime.Config, freshCreate bool) error {
 		agentCfg := findAgentByTemplate(cfg, info.Template)
-		if info.SessionKey != "" || agentCfg == nil || strings.TrimSpace(agentCfg.PromptTemplate) == "" {
+		if (info.SessionKey != "" && !freshCreate) || agentCfg == nil || strings.TrimSpace(agentCfg.PromptTemplate) == "" {
 			return nil
 		}
-		metadata := persisted.Metadata
-		sessionKind := strings.TrimSpace(metadata["real_world_app_session_kind"])
-		resolved, configuredTransport := resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg, info, sessionKind, metadata)
-		if resolved == nil {
-			return nil
-		}
-		transport := resolvedWorkerRuntimeTransport(info, resolved, configuredTransport, metadata)
-		if transport == "" && startedConfigHashProvesWorkerACPTransport(cityPath, cfg, info, sessionKind, resolved, metadata, configuredTransport) {
-			transport = config.SessionTransportACP
-		}
-		if transport == config.SessionTransportACP {
-			return nil
+		if freshCreate {
+			// A fresh create already carries its selected launch transport. Template
+			// defaults and legacy resume inference cannot override that concrete choice.
+			if strings.TrimSpace(info.Transport) == config.SessionTransportACP {
+				return nil
+			}
+		} else {
+			metadata := persisted.Metadata
+			sessionKind := strings.TrimSpace(metadata["real_world_app_session_kind"])
+			resolved, configuredTransport := resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg, info, sessionKind, metadata)
+			if resolved == nil {
+				return nil
+			}
+			transport := resolvedWorkerRuntimeTransport(info, resolved, configuredTransport, metadata)
+			if transport == "" && startedConfigHashProvesWorkerACPTransport(cityPath, cfg, info, sessionKind, resolved, metadata, configuredTransport) {
+				transport = config.SessionTransportACP
+			}
+			if transport == config.SessionTransportACP {
+				return nil
+			}
 		}
 		resolver := func(name string) string { return config.BuiltinFamily(name, cfg.Providers) }
 		if err := hooks.InstallWithResolver(fsys.OSFS{}, cityPath, start.WorkDir, start.InstallAgentHooks, resolver); err != nil {
@@ -228,6 +236,10 @@ func applyWorkerOverlayHints(hints *runtime.Config, cfg *config.City, cityPath, 
 	rigName := sessionSetupContextForAgent(cityPath, cfg.EffectiveCityName(), firstNonEmptyGCString(agentCfg.QualifiedName(), template), agentCfg, cfg.Rigs).Rig
 	hints.PackOverlayDirs = effectiveOverlayDirs(cfg.PackOverlayDirs, cfg.RigOverlayDirs, rigName)
 }
+
+// workerMCPServerResolver is the private composition port for selected catalog
+// context. Production constructors explicitly use resolvedRuntimeMCPServersWithConfig.
+type workerMCPServerResolver func(cityPath string, cfg *config.City, alias, template, provider, workDir, transport string, metadata map[string]string) ([]runtime.MCPServerConfig, error)
 
 func resolvedRuntimeMCPServersWithConfig(
 	cityPath string,
@@ -346,13 +358,33 @@ func newWorkerSessionHandleForDirectCreateWithConfig(
 	resolved *config.ResolvedProvider,
 	metadata map[string]string,
 ) (worker.Handle, error) {
-	factory, sessionCfg, err := resolvedWorkerSessionHandleConfigWithConfig(
-		cityPath, store, sp, cfg, alias, explicitName, template, title, command, provider, workDir, transport, resolved, metadata,
+	return newWorkerSessionHandleForDirectCreateWithMCPResolver(
+		cityPath, store, sp, cfg, alias, explicitName, template, title, command, provider, workDir, transport, resolved, metadata, resolvedRuntimeMCPServersWithConfig,
+	)
+}
+
+// newWorkerSessionHandleForDirectCreateWithMCPResolver keeps catalog discovery at
+// the composition edge; recording callers can supply already selected catalogs.
+func newWorkerSessionHandleForDirectCreateWithMCPResolver(
+	cityPath string,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	alias, explicitName, template, title, command, provider, workDir, transport string,
+	resolved *config.ResolvedProvider,
+	metadata map[string]string,
+	resolveMCP workerMCPServerResolver,
+) (worker.Handle, error) {
+	factory, sessionCfg, err := resolvedWorkerSessionHandleConfigWithMCPResolver(
+		cityPath, store, sp, cfg, alias, explicitName, template, title, command, provider, workDir, transport, resolved, metadata, resolveMCP,
 	)
 	if err != nil {
 		return nil, err
 	}
-	promptHints, err := workerDirectCreatePromptHints(cityPath, cfg, template, firstNonEmptyGCString(metadata["agent_name"], template), transport)
+	promptHints, err := workerDirectCreatePromptHints(cityPath, cfg, session.Info{
+		Template: template, AgentName: firstNonEmptyGCString(metadata["agent_name"], template), SessionName: sessionCfg.ExplicitName,
+		Provider: sessionCfg.Runtime.Provider,
+	}, sessionCfg.Runtime.WorkDir, sessionCfg.Transport, resolved)
 	if err != nil {
 		return nil, fmt.Errorf("resolving direct-start prompt: %w", err)
 	}
@@ -369,6 +401,21 @@ func resolvedWorkerSessionHandleConfigWithConfig(
 	resolved *config.ResolvedProvider,
 	metadata map[string]string,
 ) (*worker.Factory, worker.ResolvedSessionConfig, error) {
+	return resolvedWorkerSessionHandleConfigWithMCPResolver(
+		cityPath, store, sp, cfg, alias, explicitName, template, title, command, provider, workDir, transport, resolved, metadata, resolvedRuntimeMCPServersWithConfig,
+	)
+}
+
+func resolvedWorkerSessionHandleConfigWithMCPResolver(
+	cityPath string,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	alias, explicitName, template, title, command, provider, workDir, transport string,
+	resolved *config.ResolvedProvider,
+	metadata map[string]string,
+	resolveMCP workerMCPServerResolver,
+) (*worker.Factory, worker.ResolvedSessionConfig, error) {
 	// This caller supplies the complete runtime config directly. Leaving the
 	// persisted-record resolver off this factory keeps managed create/wake paths
 	// from invoking resume-only provider and prompt discovery.
@@ -376,7 +423,7 @@ func resolvedWorkerSessionHandleConfigWithConfig(
 	if err != nil {
 		return nil, worker.ResolvedSessionConfig{}, err
 	}
-	mcpServers, err := resolvedRuntimeMCPServersWithConfig(cityPath, cfg, alias, template, provider, workDir, transport, metadata)
+	mcpServers, err := resolveMCP(cityPath, cfg, alias, template, provider, workDir, transport, metadata)
 	if err != nil {
 		return nil, worker.ResolvedSessionConfig{}, err
 	}
@@ -412,30 +459,28 @@ func resolvedWorkerSessionHandleConfigWithConfig(
 	return factory, sessionCfg, nil
 }
 
-// workerDirectCreatePromptHints renders the configured initial prompt for a
-// direct `session new` start. It uses resolveTemplate so prompt rendering and
-// argv/flag/nudge selection match controller-managed fresh starts.
-func workerDirectCreatePromptHints(cityPath string, cfg *config.City, template, qualifiedName, transport string) (runtime.Config, error) {
-	if cfg == nil {
+// workerDirectCreatePromptHints selects initial prompt delivery from the concrete
+// launch context without preparing files or resolving template default workdirs.
+func workerDirectCreatePromptHints(cityPath string, cfg *config.City, info session.Info, workDir, transport string, resolved *config.ResolvedProvider) (runtime.Config, error) {
+	if cfg == nil || strings.TrimSpace(transport) == config.SessionTransportACP {
 		return runtime.Config{}, nil
 	}
-	if strings.TrimSpace(transport) == config.SessionTransportACP {
+	agentCfg := findAgentByTemplate(cfg, info.Template)
+	if agentCfg == nil {
 		return runtime.Config{}, nil
 	}
-	agentCfg := findAgentByTemplate(cfg, template)
-	if agentCfg == nil || strings.TrimSpace(agentCfg.PromptTemplate) == "" {
-		return runtime.Config{}, nil
+	// The direct caller may have selected a different concrete launch provider.
+	// Retain template content while projecting provider-specific prompt context.
+	launchAgent := *agentCfg
+	// start_command can resolve without a name; retain the normalized launch
+	// provider rather than falling back to an unrelated workspace provider.
+	launchAgent.Provider = firstNonEmptyGCString(resolved.Name, info.Provider, agentCfg.Provider)
+	// ACP is a transport choice, not the backend for a caller-selected shell
+	// launch. Preserve other runtime overrides (including T3 bridge).
+	if strings.TrimSpace(launchAgent.Session) == config.SessionTransportACP {
+		launchAgent.Session = transport
 	}
-	params := newAgentBuildParams(cfg.EffectiveCityName(), cityPath, cfg, nil, time.Now().UTC(), nil, nil)
-	templateParams, err := resolveTemplate(params, agentCfg, firstNonEmptyGCString(qualifiedName, template), nil)
-	if err != nil {
-		return runtime.Config{}, err
-	}
-	promptConfig, _, err := templateParamsToConfigWithDelivery(templateParams)
-	if err != nil {
-		return runtime.Config{}, err
-	}
-	return promptConfig, nil
+	return workerStartupPromptHintsForAgent(cityPath, cfg, &launchAgent, info, workDir, resolved)
 }
 
 func applyWorkerStartupPromptHints(runtimeHints *runtime.Config, promptHints runtime.Config) {
@@ -869,7 +914,10 @@ func workerFreshStartPromptHints(cityPath string, cfg *config.City, info session
 	if cfg == nil {
 		return runtime.Config{}, nil
 	}
-	agentCfg := findAgentByTemplate(cfg, info.Template)
+	return workerStartupPromptHintsForAgent(cityPath, cfg, findAgentByTemplate(cfg, info.Template), info, workDir, resolved)
+}
+
+func workerStartupPromptHintsForAgent(cityPath string, cfg *config.City, agentCfg *config.Agent, info session.Info, workDir string, resolved *config.ResolvedProvider) (runtime.Config, error) {
 	if agentCfg == nil || strings.TrimSpace(agentCfg.PromptTemplate) == "" {
 		return runtime.Config{}, nil
 	}

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -948,7 +950,7 @@ func TestResolveWorkerRuntimeProviderWithConfigMetadataIdentifiesProviderSession
 	}
 }
 
-func workerPromptFixture(t *testing.T, command, prompt string) (*config.City, session.Info, TemplateParams) {
+func workerPromptConfigFixture(t *testing.T, command, prompt string) (*config.City, session.Info) {
 	t.Helper()
 	cityDir := t.TempDir()
 	promptPath := filepath.Join(cityDir, "prompts", "worker.md")
@@ -980,6 +982,24 @@ func workerPromptFixture(t *testing.T, command, prompt string) (*config.City, se
 		SessionName:         "prompt-worker",
 		SessionNameMetadata: "prompt-worker",
 	}
+	return cfg, info
+}
+
+// workerPromptLaunchFixture records branch facts: these launch/file-ordering
+// tests do not exercise Git discovery and must not invoke it for every row.
+func workerPromptLaunchFixture(t *testing.T, prompt string) (*config.City, session.Info) {
+	t.Helper()
+	cfg, info := workerPromptConfigFixture(t, "/bin/echo", prompt)
+	cfg.Agents[0].Dir = "prompt-rig"
+	cfg.Rigs = []config.Rig{{Name: "prompt-rig", Path: info.WorkDir, DefaultBranch: "main"}}
+	info.Template = cfg.Agents[0].QualifiedName()
+	return cfg, info
+}
+
+func workerPromptFixture(t *testing.T, command, prompt string) (*config.City, session.Info, TemplateParams) {
+	t.Helper()
+	cfg, info := workerPromptConfigFixture(t, command, prompt)
+	cityDir := info.WorkDir
 	params := newAgentBuildParams(cfg.EffectiveCityName(), cityDir, cfg, nil, time.Now().UTC(), nil, nil)
 	tp, err := resolveTemplateForSessionBeadInfo(params, &cfg.Agents[0], "worker", nil, info)
 	if err != nil {
@@ -1054,6 +1074,162 @@ func TestWorkerSessionCreateDeliversStartupPromptForFreshSessions(t *testing.T) 
 			}
 			if tc.sessionIDFlag != "" && !strings.Contains(started.Command, tc.sessionIDFlag) {
 				t.Fatalf("fresh direct command = %q, want generated session-key flag %q", started.Command, tc.sessionIDFlag)
+			}
+		})
+	}
+}
+
+// Direct handle construction and refused/deferred creates cannot prepare launch files.
+func TestWorkerDirectCreateDefersPreparation(t *testing.T) {
+	for _, operation := range []string{"construct", "deferred", "occupied", "orphan-blocked"} {
+		for _, existing := range []bool{false, true} {
+			for _, direct := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/existing=%t/direct=%t", operation, existing, direct), func(t *testing.T) {
+					cfg, fixture := workerPromptLaunchFixture(t, "direct startup instructions")
+					cfg.Agents[0].Provider = "claude"
+					cfg.Providers["claude"] = config.ProviderSpec{Command: "/bin/echo", PromptMode: "arg"}
+					cfg.Agents[0].InstallAgentHooks = []string{"claude", "codex"}
+					resolved, err := config.ResolveProvider(&cfg.Agents[0], &cfg.Workspace, cfg.Providers, func(name string) (string, error) { return name, nil })
+					if err != nil {
+						t.Fatal(err)
+					}
+					overlay := t.TempDir()
+					cfg.Agents[0].OverlayDir = overlay
+					if err := os.WriteFile(filepath.Join(overlay, "direct-overlay.txt"), []byte("authorized overlay"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					targets := []string{filepath.Join(fixture.WorkDir, ".gc/settings.json"), filepath.Join(fixture.WorkDir, ".codex/hooks.json"), filepath.Join(fixture.WorkDir, "direct-overlay.txt")}
+					const sentinel = `{"sentinel":"preserve exact bytes"}`
+					if existing {
+						for _, target := range targets {
+							if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+								t.Fatal(err)
+							}
+							if err := os.WriteFile(target, []byte(sentinel), 0o644); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+					store := beads.NewMemStore()
+					sp := runtime.NewFake()
+					var provider runtime.Provider = sp
+					if operation == "orphan-blocked" {
+						orphans := newProcessTableSweepProvider(runtime.LiveRuntime{SessionID: "gc-1", City: fixture.WorkDir, PID: 1234})
+						orphans.terminateErr[1234] = fmt.Errorf("scripted unconfirmed orphan")
+						provider = orphans
+						sp = orphans.Fake
+					}
+
+					if operation == "occupied" {
+						if _, err := store.Create(beads.Bead{Type: "session", Title: "occupied", Metadata: map[string]string{"session_name": "direct-purity", "state": "active", "template": fixture.Template}}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					build := newWorkerSessionHandleForResolvedRuntimeWithConfig
+					if direct {
+						build = newWorkerSessionHandleForDirectCreateWithConfig
+					}
+					handle, err := build(fixture.WorkDir, store, provider, cfg, "", "direct-purity", fixture.Template, "title", resolved.CommandString(), resolved.Name, fixture.WorkDir, "", resolved, map[string]string{"agent_name": "worker"})
+					if err != nil {
+						t.Fatal(err)
+					}
+					switch operation {
+					case "deferred":
+						if _, err := handle.Create(context.Background(), worker.CreateModeDeferred); err != nil {
+							t.Fatal(err)
+						}
+					case "occupied", "orphan-blocked":
+						_, err := handle.Create(context.Background(), worker.CreateModeStarted)
+						if err == nil {
+							t.Fatal("ineligible create was not refused")
+						}
+						if operation == "orphan-blocked" && !strings.Contains(err.Error(), "orphan cleanup") {
+							t.Fatalf("orphan refusal=%v", err)
+						}
+					}
+					if sp.CountCalls("Start", "direct-purity") != 0 {
+						t.Fatal("non-starting request called Provider.Start")
+					}
+					for _, target := range targets {
+						data, err := os.ReadFile(target)
+						if existing {
+							if err != nil || string(data) != sentinel {
+								t.Errorf("%s rewrote existing startup file %s: %q,%v", operation, target, data, err)
+							}
+						} else if !os.IsNotExist(err) {
+							t.Errorf("%s generated startup file %s before authorized start: %d bytes,%v", operation, target, len(data), err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestWorkerDirectCreateUsesConcretePromptContext(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		workspaceProvider string
+		startCommand      bool
+	}{
+		{name: "named selected provider"},
+		{name: "unnamed start command with different workspace", workspaceProvider: "fake-codex", startCommand: true},
+		{name: "unnamed start command without workspace provider", startCommand: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, fixture := workerPromptLaunchFixture(t, "WORK={{.WorkDir}} ID={{.AgentName}} PROVIDER={{.ProviderKey}}")
+			if err := os.Rename(filepath.Join(fixture.WorkDir, cfg.Agents[0].PromptTemplate), filepath.Join(fixture.WorkDir, "prompts/direct.template.md")); err != nil {
+				t.Fatal(err)
+			}
+			cfg.Agents[0].PromptTemplate = "prompts/direct.template.md"
+			cfg.Agents[0].WorkDir = filepath.Join(fixture.WorkDir, "configured-must-remain-unused")
+			cfg.Workspace.Provider = tc.workspaceProvider
+			selected := &config.Agent{Provider: "selected"}
+			cfg.Providers["selected"] = config.ProviderSpec{Command: "/bin/echo", PromptMode: "flag", PromptFlag: "--prompt"}
+			expectedProvider := "selected"
+			if tc.startCommand {
+				cfg.Agents[0].Provider = "claude"
+				cfg.Agents[0].StartCommand = "/bin/echo"
+				cfg.Agents[0].PromptMode = "flag"
+				cfg.Agents[0].PromptFlag = "--prompt"
+				selected = &cfg.Agents[0]
+				expectedProvider = "claude"
+			}
+			configuredProvider := cfg.Agents[0].Provider
+			resolved, err := config.ResolveProvider(selected, &cfg.Workspace, cfg.Providers, func(name string) (string, error) { return name, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.startCommand && resolved.Name != "" {
+				t.Fatalf("start_command provider unexpectedly named: %q", resolved.Name)
+			}
+			actualDir := filepath.Join(fixture.WorkDir, "selected-runtime-dir")
+			sp := runtime.NewFake()
+			handle, err := newWorkerSessionHandleForDirectCreateWithConfig(fixture.WorkDir, beads.NewMemStore(), sp, cfg, "", "direct-context", fixture.Template, "title", resolved.CommandString(), expectedProvider, actualDir, "", resolved, map[string]string{"agent_name": "concrete-owner"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := handle.Create(context.Background(), worker.CreateModeStarted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			launch := sp.LastStartConfig(info.SessionName)
+			if launch == nil || launch.WorkDir != actualDir || launch.PromptFlag != "--prompt" {
+				t.Fatalf("direct selected launch context=%#v", launch)
+			}
+			if info.Provider != expectedProvider {
+				t.Fatalf("direct provider persisted=%q want=%q", info.Provider, expectedProvider)
+			}
+			for _, want := range []string{"WORK=" + actualDir, "ID=concrete-owner", "PROVIDER=" + info.Provider} {
+				if !strings.Contains(launch.PromptSuffix, want) {
+					t.Errorf("direct prompt omitted concrete context %q: %s", want, launch.PromptSuffix)
+				}
+			}
+			if cfg.Agents[0].Provider != configuredProvider {
+				t.Fatal("prompt resolution mutated template provider")
+			}
+			if _, err := os.Stat(cfg.Agents[0].WorkDir); !os.IsNotExist(err) {
+				t.Fatalf("selected context prepared configured directory: %v", err)
 			}
 		})
 	}
@@ -3220,64 +3396,141 @@ func (p *stagingWorkerProvider) Start(ctx context.Context, name string, cfg runt
 }
 
 func TestWorkerFreshFallbackStartPreparesHooks(t *testing.T) {
-	cfg, fixture, _ := workerPromptFixture(t, "/bin/echo", "authorized startup instructions")
-	cityDir := fixture.WorkDir
-	workDir := filepath.Join(cityDir, "persisted-session-dir")
-	cfg.Agents[0].WorkDir = filepath.Join(cityDir, "configured-must-remain-absent")
-	cfg.Agents[0].Provider = "claude"
-	cfg.Providers["claude"] = config.ProviderSpec{Command: "/bin/echo", PromptMode: "arg"}
-	cfg.Agents[0].InstallAgentHooks = []string{"claude", "codex"}
-	overlay := t.TempDir()
-	cfg.Agents[0].OverlayDir = overlay
-	if err := os.WriteFile(filepath.Join(overlay, "sentinel.txt"), []byte("staged"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	store := beads.NewMemStore()
-	sp := &stagingWorkerProvider{runtime.NewFake()}
-	mgr := session.NewManagerWithOptions(store, sp)
-	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{
-		BeadOnly: true, Template: "worker", Command: "/bin/echo", WorkDir: workDir, Provider: "claude",
-		ExtraMeta: map[string]string{"agent_name": "worker", "session_origin": "manual"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	handle, err := workerHandleForSessionWithConfig(cityDir, store, sp, cfg, info.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, target := range []string{filepath.Join(cityDir, ".gc/settings.json"), filepath.Join(workDir, ".codex/hooks.json")} {
-		if _, err := os.Stat(target); !os.IsNotExist(err) {
-			t.Fatalf("handle construction prepared %s: %v", target, err)
-		}
-	}
-	if err := handle.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if b, err := os.ReadFile(filepath.Join(workDir, "sentinel.txt")); err != nil || string(b) != "staged" {
-		t.Fatalf("start overlay = %q, err=%v", b, err)
-	}
-	for _, target := range []string{filepath.Join(cityDir, ".gc/settings.json"), filepath.Join(workDir, ".codex/hooks.json")} {
-		if data, err := os.ReadFile(target); err != nil || !json.Valid(data) {
-			t.Errorf("authorized Start missing generated hooks/settings %s: %v", target, err)
-		}
-	}
-	started := sp.LastStartConfig(info.SessionName)
-	if started == nil || started.WorkDir != workDir {
-		t.Fatalf("start = %#v, want persisted workdir %q", started, workDir)
-	}
-	settingsFound := false
-	args := shellquote.Split(started.Command)
-	for i, arg := range args {
-		if arg == "--settings" && i+1 < len(args) && args[i+1] == filepath.Join(cityDir, ".gc/settings.json") {
-			settingsFound = true
-		}
-	}
-	if !settingsFound {
-		t.Errorf("start command omitted projected settings: %q", started.Command)
-	}
-	if _, err := os.Stat(cfg.Agents[0].WorkDir); !os.IsNotExist(err) {
-		t.Fatalf("start prepared configured directory instead of persisted directory: %v", err)
+	for _, operation := range []string{"missing-key fallback", "direct no key", "direct generated key"} {
+		t.Run(operation, func(t *testing.T) {
+			cfg, fixture := workerPromptLaunchFixture(t, "authorized startup instructions")
+			cityDir := fixture.WorkDir
+			workDir := filepath.Join(cityDir, "persisted-session-dir")
+			cfg.Agents[0].WorkDir = filepath.Join(cityDir, "configured-must-remain-absent")
+			cfg.Agents[0].Provider = "claude"
+			cfg.Providers["claude"] = config.ProviderSpec{Command: "/bin/echo", PromptMode: "arg"}
+			cfg.Agents[0].InstallAgentHooks = []string{"claude", "codex"}
+			overlay := t.TempDir()
+			cfg.Agents[0].OverlayDir = overlay
+			if err := os.WriteFile(filepath.Join(overlay, "sentinel.txt"), []byte("staged"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			store := beads.NewMemStore()
+			sp := &stagingWorkerProvider{runtime.NewFake()}
+			var info session.Info
+			var handle worker.Handle
+			var err error
+			if operation == "missing-key fallback" {
+				mgr := session.NewManagerWithOptions(store, sp)
+				info, err = mgr.CreateSession(context.Background(), session.CreateOptions{BeadOnly: true, Template: fixture.Template, Command: "/bin/echo", WorkDir: workDir, Provider: "claude", ExtraMeta: map[string]string{"agent_name": "worker", "session_origin": "manual"}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				handle, err = workerHandleForSessionWithConfig(cityDir, store, sp, cfg, info.ID)
+			} else {
+				spec := cfg.Providers["claude"]
+				spec.ResumeFlag = "--resume"
+				if operation == "direct generated key" {
+					spec.SessionIDFlag = "--session-id"
+				}
+				cfg.Providers["claude"] = spec
+				resolved, resolveErr := config.ResolveProvider(&cfg.Agents[0], &cfg.Workspace, cfg.Providers, func(name string) (string, error) { return name, nil })
+				if resolveErr != nil {
+					t.Fatal(resolveErr)
+				}
+				if operation == "direct no key" {
+					resolved.SessionIDFlag = ""
+				} // override inherited Claude defaults in this explicit keyless fixture
+				handle, err = newWorkerSessionHandleForDirectCreateWithConfig(cityDir, store, sp, cfg, "", "direct-hooks", fixture.Template, "title", resolved.CommandString(), resolved.Name, workDir, "", resolved, map[string]string{"agent_name": "worker"})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, target := range []string{filepath.Join(cityDir, ".gc/settings.json"), filepath.Join(workDir, ".codex/hooks.json")} {
+				if _, err := os.Stat(target); !os.IsNotExist(err) {
+					t.Fatalf("handle construction prepared %s: %v", target, err)
+				}
+			}
+			if operation == "missing-key fallback" {
+				err = handle.Start(context.Background())
+			} else {
+				info, err = handle.Create(context.Background(), worker.CreateModeStarted)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if b, err := os.ReadFile(filepath.Join(workDir, "sentinel.txt")); err != nil || string(b) != "staged" {
+				t.Fatalf("start overlay = %q, err=%v", b, err)
+			}
+			for _, target := range []string{filepath.Join(cityDir, ".gc/settings.json"), filepath.Join(workDir, ".codex/hooks.json")} {
+				if data, err := os.ReadFile(target); err != nil || !json.Valid(data) {
+					t.Errorf("authorized Start missing generated hooks/settings %s: %v", target, err)
+				}
+			}
+			started := sp.LastStartConfig(info.SessionName)
+			if started == nil || started.WorkDir != workDir {
+				t.Fatalf("start = %#v, want persisted workdir %q", started, workDir)
+			}
+			settingsFound := false
+			args := shellquote.Split(started.Command)
+			for i, arg := range args {
+				if arg == "--settings" && i+1 < len(args) && args[i+1] == filepath.Join(cityDir, ".gc/settings.json") {
+					settingsFound = true
+				}
+			}
+			if !settingsFound {
+				t.Errorf("start command omitted projected settings: %q", started.Command)
+			}
+			if _, err := os.Stat(cfg.Agents[0].WorkDir); !os.IsNotExist(err) {
+				t.Fatalf("start prepared configured directory instead of persisted directory: %v", err)
+			}
+
+			if operation == "direct no key" && info.SessionKey != "" {
+				t.Fatalf("keyless fixture generated a provider key %q", info.SessionKey)
+			}
+			if operation == "direct generated key" {
+				if info.SessionKey == "" || !strings.Contains(started.Command, "--session-id "+info.SessionKey) {
+					t.Fatalf("fresh generated key lost: key=%q command=%q", info.SessionKey, started.Command)
+				}
+				const preserved = `{"preserve":"genuine resume"}`
+				for _, target := range []string{filepath.Join(cityDir, ".gc/settings.json"), filepath.Join(workDir, ".codex/hooks.json")} {
+					if err := os.WriteFile(target, []byte(preserved), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := sp.Stop(info.SessionName); err != nil {
+					t.Fatal(err)
+				} // virtual runtime only
+				// Legacy keyed records may lack completion metadata. Missing fields alone
+				// must never be treated as authorization for fresh-create preparation.
+				if err := store.SetMetadataBatch(info.ID, map[string]string{"creation_complete_at": "", "started_config_hash": ""}); err != nil {
+					t.Fatal(err)
+				}
+				resumeCtx, cancelResume := context.WithCancel(context.Background())
+				defer cancelResume()
+				waitCalls := 0
+				resumed, err := workerHandleForSessionWithStaleKeyDetectionWaiter(cityDir, store, sp, cfg, info.ID, func(waitCtx context.Context, name string) error {
+					waitCalls++
+					if waitCtx != resumeCtx || name != info.SessionName {
+						t.Errorf("resume waiter context/session changed: context matches=%t session=%q want=%q", waitCtx == resumeCtx, name, info.SessionName)
+					}
+					return waitCtx.Err()
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := resumed.Start(resumeCtx); err != nil {
+					t.Fatal(err)
+				}
+				if waitCalls != 1 {
+					t.Fatalf("resume waiter calls=%d want1", waitCalls)
+				}
+				launch := sp.LastStartConfig(info.SessionName)
+				if launch == nil || !strings.Contains(launch.Command, "--resume "+info.SessionKey) || launch.PromptSuffix != "" || launch.PromptFlag != "" || launch.Nudge != "" || launch.Env[startupPromptDeliveredEnv] != "" {
+					t.Fatalf("genuine keyed resume replayed startup: %#v", launch)
+				}
+				for _, target := range []string{filepath.Join(cityDir, ".gc/settings.json"), filepath.Join(workDir, ".codex/hooks.json")} {
+					if data, err := os.ReadFile(target); err != nil || string(data) != preserved {
+						t.Fatalf("keyed resume rewrote hooks/settings %s: %q,%v", target, data, err)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -3307,7 +3560,7 @@ func TestWorkerRuntimeStartPreparerKeepsMetadataBackedACPRoute(t *testing.T) {
 	start := runtime.Config{Command: "/bin/echo", WorkDir: cityDir, ProviderName: "claude", InstallAgentHooks: []string{"claude", "codex"}}
 	persisted := session.PersistedResponse{Metadata: map[string]string{session.MCPIdentityMetadataKey: "session-mcp-binding"}}
 	info.MCPIdentity = persisted.Metadata[session.MCPIdentityMetadataKey]
-	if err := prepare(info, persisted, &start); err != nil {
+	if err := prepare(info, persisted, &start, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, rel := range []string{".gc/settings.json", ".codex/hooks.json"} {
@@ -3352,6 +3605,121 @@ func TestResolvedWorkerRuntimeFreshFallbackOversizedLogIdentity(t *testing.T) {
 			} {
 				if got := fields[field].String(); got != want {
 					t.Errorf("log field %s = %q, want %q (template=%q)", field, got, want, info.Template)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkerDirectCreateUsesSelectedTransport(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		transport   string
+		loaderError bool
+	}{
+		{name: "shell"},
+		{name: "acp", transport: "acp"},
+		{name: "catalog error before preparation", transport: "acp", loaderError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, fixture := workerPromptLaunchFixture(t, "ACP protocol owns the initial request")
+			supported := true
+			cfg.Agents[0].Provider = "claude"
+			cfg.Agents[0].Session = "acp"
+			cfg.Agents[0].InstallAgentHooks = []string{"claude", "codex"}
+			cfg.Providers["claude"] = config.ProviderSpec{Command: "/bin/echo", ACPCommand: "/bin/echo", SupportsACP: &supported, PromptMode: "arg"}
+			resolved, err := config.ResolveProvider(&cfg.Agents[0], &cfg.Workspace, cfg.Providers, func(name string) (string, error) { return name, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata := map[string]string{"agent_name": "worker", "sentinel": "selected-context"}
+			if tc.transport == "acp" {
+				metadata[session.MCPIdentityMetadataKey] = "catalog-owner"
+			}
+			catalog := []runtime.MCPServerConfig{{Name: "filesystem", Transport: runtime.MCPTransportStdio, Command: "/scripted/mcp", Args: []string{"--stdio", "selected-context"}, Env: map[string]string{"SELECTED": "context"}}}
+			loaderErr := fmt.Errorf("loading effective MCP: scripted catalog error")
+			calls := 0
+			loadMCP := func(cityPath string, gotConfig *config.City, alias, template, provider, workDir, transport string, gotMeta map[string]string) ([]runtime.MCPServerConfig, error) {
+				calls++
+				if cityPath != fixture.WorkDir || gotConfig != cfg || alias != "direct-alias" || template != fixture.Template || provider != resolved.Name || workDir != fixture.WorkDir || transport != tc.transport || !reflect.DeepEqual(gotMeta, metadata) {
+					t.Errorf("MCP loader received wrong selected context: city=%q config=%p alias=%q template=%q provider=%q workdir=%q transport=%q metadata=%v", cityPath, gotConfig, alias, template, provider, workDir, transport, gotMeta)
+				}
+				// The production resolver keeps this transport guard before catalog I/O.
+				if transport != "acp" {
+					return nil, nil
+				}
+				if tc.loaderError {
+					return nil, loaderErr
+				}
+				return catalog, nil
+			}
+			store := beads.NewMemStore()
+			sp := runtime.NewFake()
+			handle, err := newWorkerSessionHandleForDirectCreateWithMCPResolver(fixture.WorkDir, store, sp, cfg, "direct-alias", "direct-acp", fixture.Template, "title", resolved.CommandString(), resolved.Name, fixture.WorkDir, tc.transport, resolved, metadata, loadMCP)
+			if calls != 1 {
+				t.Fatalf("MCP loader calls=%d want1", calls)
+			}
+			targets := []string{filepath.Join(fixture.WorkDir, ".gc/settings.json"), filepath.Join(fixture.WorkDir, ".codex/hooks.json")}
+			if tc.loaderError {
+				if handle != nil || !errors.Is(err, loaderErr) {
+					t.Fatalf("loader error wrapping changed: handle=%v err=%v want=%v", handle != nil, err, loaderErr)
+				}
+				if sp.CountCalls("Start", "direct-acp") != 0 {
+					t.Fatal("loader failure called Provider.Start")
+				}
+				for _, target := range targets {
+					if _, err := os.Stat(target); !os.IsNotExist(err) {
+						t.Fatalf("loader failure prepared %s: %v", target, err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := handle.Create(context.Background(), worker.CreateModeStarted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			launch := sp.LastStartConfig(info.SessionName)
+			if launch == nil || info.Transport != tc.transport || info.WorkDir != fixture.WorkDir || launch.WorkDir != fixture.WorkDir || info.Provider != resolved.Name || info.AgentName != "worker" {
+				t.Fatalf("selected launch identity/transport/workdir changed: info=%+v launch=%#v", info, launch)
+			}
+			if tc.transport == "acp" {
+				if launch.PromptSuffix != "" || launch.PromptFlag != "" || launch.Nudge != "" || launch.Env[startupPromptDeliveredEnv] != "" {
+					t.Fatal("ACP direct create replayed shell startup prompt")
+				}
+				if !reflect.DeepEqual(launch.MCPServers, runtime.NormalizeMCPServerConfigs(catalog)) {
+					t.Fatalf("selected MCP catalog not forwarded: got=%#v want=%#v", launch.MCPServers, catalog)
+				}
+			} else {
+				if launch.PromptSuffix == "" || launch.Env[startupPromptDeliveredEnv] != "1" {
+					t.Fatal("selected shell transport lost initial prompt")
+				}
+				if len(launch.MCPServers) != 0 {
+					t.Fatalf("shell acquired ACP catalog: %#v", launch.MCPServers)
+				}
+			}
+			for _, target := range targets {
+				data, err := os.ReadFile(target)
+				if tc.transport == "acp" {
+					if !os.IsNotExist(err) {
+						t.Fatalf("ACP direct create prepared shell hook/settings %s: %v", target, err)
+					}
+				} else if err != nil || !json.Valid(data) {
+					t.Fatalf("selected shell transport omitted valid requested setup %s: %v", target, err)
+				}
+			}
+			if tc.transport != "acp" {
+				args := shellquote.Split(launch.Command)
+				found := false
+				for i, arg := range args {
+					if arg == "--settings" && i+1 < len(args) && args[i+1] == filepath.Join(fixture.WorkDir, ".gc/settings.json") {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("shell command omitted settings argument: %q", launch.Command)
 				}
 			}
 		})

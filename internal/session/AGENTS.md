@@ -90,3 +90,7 @@ evidence from tests, source, an issue, or a commit.
   prompt through the canonical argv, flag, or nudge policy before Provider.Start
   and mark delivery only when a route was selected. A valid-key resume omits
   that initial prompt so it is not replayed into the existing conversation.
+  Direct prompt construction must stay pure. The session-owned start preparer
+  receives explicit fresh-create context because a generated provider key is
+  already persisted before that first launch. Do not infer fresh creation from
+  key presence, lifecycle state, or absent legacy completion metadata.
